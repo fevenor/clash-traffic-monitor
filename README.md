@@ -9,17 +9,11 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/zhf883680/clash-traffic-monitor/stargazers">
-    <img src="https://img.shields.io/github/stars/zhf883680/clash-traffic-monitor?style=flat-square&color=yellow" alt="Stars" />
+  <a href="https://github.com/fevenor/clash-traffic-monitor/stargazers">
+    <img src="https://img.shields.io/github/stars/fevenor/clash-traffic-monitor?style=flat-square&color=yellow" alt="Stars" />
   </a>
-  <a href="https://hub.docker.com/r/zhf883680/clash-traffic-monitor">
-    <img src="https://img.shields.io/docker/pulls/zhf883680/clash-traffic-monitor?style=flat-square&color=2496ED&logo=docker" alt="Docker Pulls" />
-  </a>
-  <a href="https://hub.docker.com/r/zhf883680/clash-traffic-monitor">
-    <img src="https://img.shields.io/docker/v/zhf883680/clash-traffic-monitor?style=flat-square&label=Docker&color=2496ED" alt="Docker Version" />
-  </a>
-  <a href="https://hub.docker.com/r/zhf883680/clash-traffic-monitor">
-    <img src="https://img.shields.io/docker/image-size/zhf883680/clash-traffic-monitor/latest?style=flat-square&logo=docker" alt="Image Size" />
+  <a href="https://github.com/fevenor/clash-traffic-monitor/pkgs/container/clash-traffic-monitor">
+    <img src="https://img.shields.io/badge/docker-ghcr.io-2496ED?style=flat-square&logo=docker" alt="Docker ghcr.io" />
   </a>
 </p>
 
@@ -74,7 +68,7 @@
 
 ### 本地运行
 
-推荐直接从 [Releases](https://github.com/zhf883680/clash-traffic-monitor/releases/latest) 下载对应平台的二进制文件运行。
+推荐直接从 [Releases](https://github.com/fevenor/clash-traffic-monitor/releases/latest) 下载对应平台的二进制文件运行。
 
 #### Windows
 
@@ -142,7 +136,7 @@ docker run -d \
   -e MIHOMO_URL=http://host.docker.internal:9090 \
   -e MIHOMO_SECRET=your-secret \
   -v "$(pwd)/data:/data" \
-  zhf883680/clash-traffic-monitor:latest
+  ghcr.io/fevenor/clash-traffic-monitor:latest
 ```
 
 如果 Mihomo 没有设置密钥，可以把 `MIHOMO_SECRET` 留空。
@@ -223,7 +217,7 @@ docker run -d \
   -e OPENWRT_UBUS_USERNAME=monitor \
   -e OPENWRT_UBUS_PASSWORD=your-password \
   -v "$(pwd)/data:/data" \
-  zhf883680/clash-traffic-monitor:latest
+  ghcr.io/fevenor/clash-traffic-monitor:latest
 ```
 
 ## 存储策略
