@@ -34,6 +34,11 @@ const (
 	aggregateFlushInterval = 10 * time.Minute
 	defaultRetentionDays  = 30
 	defaultAllowedOrigin   = "*"
+
+	// Device identity resolution constants
+	deviceMappingRefreshInterval   = 5 * time.Minute
+	deviceMappingDebounceInterval  = 30 * time.Second
+	deviceMappingPeriodicInterval = 5 * time.Minute
 )
 
 var isContainerRuntime = func() bool {
@@ -42,9 +47,12 @@ var isContainerRuntime = func() bool {
 }
 
 type config struct {
-	ListenAddr   string
-	MihomoURL    string
-	MihomoSecret string
+	ListenAddr       string
+	MihomoURL        string
+	MihomoSecret     string
+	UbusURL          string
+	UbusUsername     string
+	UbusPassword     string
 }
 
 type mihomoSettings struct {
@@ -115,6 +123,7 @@ type trafficLog struct {
 
 type aggregatedData struct {
 	Label    string `json:"label"`
+	Mac      string `json:"mac"`
 	Upload   int64  `json:"upload"`
 	Download int64  `json:"download"`
 	Total    int64  `json:"total"`
@@ -126,6 +135,7 @@ type trendPoint struct {
 	Upload    int64 `json:"upload"`
 	Download  int64 `json:"download"`
 }
+
 
 type connectionDetail struct {
 	DestinationIP string   `json:"destinationIP"`
@@ -186,6 +196,13 @@ type service struct {
 	aggregateBuffer       map[string]*aggregatedEntry
 	hostMinuteWindows     map[string]*hostTrafficWindow
 	aggregateRetentionDays int
+
+	// Device identity resolution
+	ubusCli             *ubusClient
+	deviceMappings      map[string]*deviceMapping
+	deviceMappingMu     sync.RWMutex
+	deviceRefreshMu     sync.Mutex
+	lastDeviceRefresh   time.Time
 }
 
 type aggregatedEntry struct {
@@ -239,6 +256,23 @@ func main() {
 		lastVacuum:            time.Now(),
 		aggregateBuffer:       make(map[string]*aggregatedEntry),
 		hostMinuteWindows:     make(map[string]*hostTrafficWindow),
+		deviceMappings:        make(map[string]*deviceMapping),
+	}
+
+	// 初始化 ubus 客户端（仅在 OPENWRT_UBUS_URL 配置时）
+	if cfg.UbusURL != "" {
+		svc.ubusCli = &ubusClient{
+			url:      cfg.UbusURL,
+			username: cfg.UbusUsername,
+			password: cfg.UbusPassword,
+			client:   &http.Client{Timeout: 10 * time.Second},
+		}
+		// 从 device_mappings 表加载历史映射到内存
+		if err := svc.loadDeviceMappingsFromDB(); err != nil {
+			log.Printf("加载历史设备映射失败: %v", err)
+		} else {
+			log.Printf("已从数据库加载 %d 条设备映射", len(svc.deviceMappings))
+		}
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -249,6 +283,11 @@ func main() {
 		defer close(collectorDone)
 		svc.runCollector(ctx)
 	}()
+
+	// 启动定期设备映射刷新（仅在 ubus 已配置时）
+	if svc.ubusEnabled() {
+		go svc.runPeriodicDeviceRefresh(ctx)
+	}
 
 	server := &http.Server{
 		Addr:              cfg.ListenAddr,
@@ -289,6 +328,9 @@ func loadConfig() (config, error) {
 		ListenAddr:   getenv("TRAFFIC_MONITOR_LISTEN", defaultListenAddr),
 		MihomoURL:    strings.TrimRight(getenv("MIHOMO_URL", ""), "/"),
 		MihomoSecret: getenv("MIHOMO_SECRET", ""),
+		UbusURL:      strings.TrimRight(getenv("OPENWRT_UBUS_URL", ""), "/"),
+		UbusUsername: getenv("OPENWRT_UBUS_USERNAME", ""),
+		UbusPassword: getenv("OPENWRT_UBUS_PASSWORD", ""),
 	}
 
 	return cfg, nil
@@ -388,6 +430,17 @@ func openDatabase(path string) (*sql.DB, error) {
 	);
 
 	CREATE INDEX IF NOT EXISTS idx_auto_switch_events_triggered_at ON auto_switch_events(triggered_at DESC);
+
+	CREATE TABLE IF NOT EXISTS device_mappings (
+		ip TEXT NOT NULL,
+		mac TEXT NOT NULL,
+		hostname TEXT NOT NULL DEFAULT '',
+		first_seen INTEGER NOT NULL,
+		last_seen INTEGER NOT NULL,
+		PRIMARY KEY (ip, mac)
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_device_mappings_ip ON device_mappings(ip);
 	`
 
 	if _, err := db.Exec(schema); err != nil {
@@ -1169,6 +1222,17 @@ func (s *service) processConnections(payload *connectionsResponse) error {
 	}
 	s.mu.Unlock()
 
+	// 检测新 source_ip，异步触发设备映射刷新
+	sourceIPs := make([]string, 0, len(logs))
+	for _, log := range logs {
+		if log.SourceIP != "" {
+			sourceIPs = append(sourceIPs, log.SourceIP)
+		}
+	}
+	if len(sourceIPs) > 0 {
+		s.checkNewIPs(sourceIPs)
+	}
+
 	if len(logs) > 0 {
 		if err := s.addToAggregateBuffer(logs, nowMS); err != nil {
 			return err
@@ -1724,6 +1788,11 @@ func (s *service) cleanupOldLogs(nowMS int64) error {
 		return err
 	}
 
+	// 同时清理 device_mappings 中 last_seen 早于 retention 截止时间的记录
+	if _, err := s.db.Exec(`DELETE FROM device_mappings WHERE last_seen < ?`, aggCutoff); err != nil {
+		return err
+	}
+
 	// 定期执行VACUUM（每周一次）
 	if time.Since(s.lastVacuum) >= 7*24*time.Hour {
 		if _, err := s.db.Exec(`VACUUM`); err != nil {
@@ -1754,6 +1823,8 @@ func normalizeHost(host string) string {
 	}
 	return parts[len(parts)-2] + "." + parts[len(parts)-1]
 }
+
+
 
 func (s *service) addToAggregateBuffer(logs []trafficLog, nowMS int64) error {
 	s.mu.Lock()
@@ -2109,6 +2180,11 @@ func (s *service) handleAggregate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 对 sourceIP 维度应用设备 label 增强和 MAC 聚合
+	if dimension == "sourceIP" {
+		data = s.applyDeviceLabelAndMACAggregate(data, start, end)
+	}
+
 	writeJSON(w, http.StatusOK, data)
 }
 
@@ -2128,6 +2204,20 @@ func (s *service) handleSubstats(w http.ResponseWriter, r *http.Request) {
 	if label == "" {
 		writeError(w, http.StatusBadRequest, errors.New("label is required"))
 		return
+	}
+
+	// 对 sourceIP 维度，检查是否以 MAC 地址传入，若是则反查所有关联 IP
+	if dimension == "sourceIP" && s.ubusEnabled() && looksLikeMAC(label) {
+		ips := s.resolveMACToIPs(label, start, end)
+		if len(ips) > 0 {
+			data, err := s.querySubstatsByIPs(dimension, ips, start, end)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, err)
+				return
+			}
+			writeJSON(w, http.StatusOK, data)
+			return
+		}
 	}
 
 	data, err := s.querySubstats(dimension, label, start, end)
@@ -2188,6 +2278,8 @@ func (s *service) handleDevicesByHost(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	// 应用设备 label 增强和 MAC 聚合
+	data = s.applyDeviceLabelAndMACAggregate(data, start, end)
 	writeJSON(w, http.StatusOK, data)
 }
 
@@ -2220,6 +2312,8 @@ func (s *service) handleDevicesByProxyHost(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	// 应用设备 label 增强和 MAC 聚合
+	data = s.applyDeviceLabelAndMACAggregate(data, start, end)
 	writeJSON(w, http.StatusOK, data)
 }
 
@@ -2265,6 +2359,20 @@ func (s *service) handleConnectionDetails(w http.ResponseWriter, r *http.Request
 	if primary == "" || secondary == "" {
 		writeError(w, http.StatusBadRequest, errors.New("primary and secondary are required"))
 		return
+	}
+
+	// 对 sourceIP 维度，检查 primary 是否以 MAC 地址传入
+	if dimension == "sourceIP" && s.ubusEnabled() && looksLikeMAC(primary) {
+		ips := s.resolveMACToIPs(primary, start, end)
+		if len(ips) > 0 {
+			data, err := s.queryConnectionDetailsByIPs(ips, secondary, start, end)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, err)
+				return
+			}
+			writeJSON(w, http.StatusOK, data)
+			return
+		}
 	}
 
 	data, err := s.queryConnectionDetails(dimension, primary, secondary, start, end)
@@ -2391,6 +2499,7 @@ func (s *service) queryByFilters(groupColumn, extraFilter string, extraArgs []an
 
 	return sortedAggregatedDataRows(merged), nil
 }
+
 
 func (s *service) queryConnectionDetails(dimension, primary, secondary string, start, end int64) ([]connectionDetail, error) {
 	filter, args, err := detailFilter(dimension, primary, secondary)
@@ -2713,6 +2822,32 @@ func matchesAggregateEntryFilters(entry aggregatedEntry, filter string, args []a
 				return false
 			}
 			argIdx += 2
+			continue
+		}
+		// Handle IN clause: col IN (?,?,?,...)
+		if idx := strings.Index(clause, " IN ("); idx > 0 {
+			column := strings.TrimSpace(clause[:idx])
+			rest := clause[idx+5:] // skip " IN ("
+			if !strings.HasSuffix(rest, ")") {
+				return false
+			}
+			placeholderPart := strings.TrimSuffix(rest, ")")
+			placeholderCount := strings.Count(placeholderPart, "?")
+			if placeholderCount == 0 || argIdx+placeholderCount > len(args) {
+				return false
+			}
+			fieldVal := aggregateEntryFieldValue(entry, column)
+			matched := false
+			for i := 0; i < placeholderCount; i++ {
+				if fieldVal == fmt.Sprint(args[argIdx+i]) {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				return false
+			}
+			argIdx += placeholderCount
 			continue
 		}
 		// Handle simple clause: col = ?

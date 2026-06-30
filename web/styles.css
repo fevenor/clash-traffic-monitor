@@ -1156,6 +1156,16 @@ th {
   max-width: 100%;
 }
 
+.device-mac {
+  font-size: 11px;
+  color: var(--muted);
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+
 .primary-row,
 .secondary-row {
   cursor: pointer;

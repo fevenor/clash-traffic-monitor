@@ -106,6 +106,7 @@ const state = {
   secondaryRows: [],
   detailRows: [],
   selectedPrimary: null,
+  selectedPrimaryLabel: null,
   selectedSecondary: null,
   detailSearchQuery: "",
   loadSeq: 0,
@@ -354,11 +355,11 @@ function syncContextSummary() {
   }
 
   if (!state.selectedSecondary) {
-    elements.selectionPath.textContent = `${config.countLabel} / ${state.selectedPrimary}`
+    elements.selectionPath.textContent = `${config.countLabel} / ${state.selectedPrimaryLabel || state.selectedPrimary}`
     return
   }
 
-  elements.selectionPath.textContent = `${config.countLabel} / ${state.selectedPrimary} / ${state.selectedSecondary}`
+  elements.selectionPath.textContent = `${config.countLabel} / ${state.selectedPrimaryLabel || state.selectedPrimary} / ${state.selectedSecondary}`
 }
 
 function buildAutoSwitchSummary() {
@@ -386,10 +387,11 @@ function updateViewHints() {
   const groupedHostMode = elements.dimension.value === "host" && state.domainGroupingEnabled
 
   const secondaryColumn = groupedHostMode ? "子域名" : config.secondaryColumn
+  const displayPrimary = state.selectedPrimaryLabel || state.selectedPrimary
   const secondaryTitle = groupedHostMode
-    ? (state.selectedPrimary ? `${state.selectedPrimary} 的子域名` : "子域名")
-    : config.buildSecondaryTitle(state.selectedPrimary)
-  const detailTitle = config.buildDetailTitle(state.selectedPrimary, state.selectedSecondary)
+    ? (state.selectedPrimary ? `${displayPrimary} 的子域名` : "子域名")
+    : config.buildSecondaryTitle(displayPrimary)
+  const detailTitle = config.buildDetailTitle(displayPrimary, state.selectedSecondary)
 
   elements.countLabel.textContent = config.countLabel
   elements.primaryTitle.textContent = config.primaryTitle
@@ -810,13 +812,31 @@ function renderPrimaryTable(rows) {
   elements.tableBody.innerHTML = rows
     .slice(0, 120)
     .map((row, index) => {
-      const active = state.selectedPrimary === row.label ? " active" : ""
+      // data-primary: use mac if available (for API dril ldown), else label (raw IP)
+      const primaryValue = row.mac || row.label
+      const active = state.selectedPrimary === primaryValue ? " active" : ""
+
+      // Build label + optional MAC subline
+      const labelSafe = escapeHTML(row.label)
+      let tooltipText = labelSafe
+      let macHtml = ""
+      if (row.mac) {
+        tooltipText = labelSafe + " (" + escapeHTML(row.mac) + ")"
+        // Only show subline if label differs from MAC (avoids duplicate when hostname empty)
+        if (row.label !== row.mac) {
+          macHtml = `<span class="device-mac" title="${escapeHTML(row.mac)}">${escapeHTML(row.mac)}</span>`
+        }
+      }
+
       return `
-        <div class="ranking-item primary-row${active}" tabindex="0" data-primary="${escapeHTML(row.label)}">
+        <div class="ranking-item primary-row${active}" tabindex="0" data-primary="${escapeHTML(primaryValue)}" data-label="${labelSafe}">
           <div class="ranking-main">
             <div class="ranking-title">
               <span class="rank">${index + 1}</span>
-              <div class="mono">${renderTruncatedText(row.label, "host", "-")}</div>
+              <div class="mono">
+                <span class="truncate host" title="${tooltipText}">${labelSafe}</span>
+                ${macHtml}
+              </div>
             </div>
             <div class="ranking-total mono">${formatBytes(row.total)}</div>
           </div>
@@ -1167,6 +1187,7 @@ async function loadDetails(primaryLabel, secondaryLabel) {
 
 function resetDetailPanels() {
   state.selectedPrimary = null
+  state.selectedPrimaryLabel = null
   state.selectedSecondary = null
   state.secondaryRows = []
   state.detailRows = []
@@ -1215,7 +1236,14 @@ async function loadData() {
     if (seq !== state.loadSeq) return
 
     state.primaryRows = rows
-    state.selectedPrimary = rows[0]?.label || null
+    const firstRow = rows[0]
+    if (firstRow) {
+      state.selectedPrimary = firstRow.mac || firstRow.label
+      state.selectedPrimaryLabel = firstRow.label
+    } else {
+      state.selectedPrimary = null
+      state.selectedPrimaryLabel = null
+    }
 
     renderCards(rows)
     renderPrimaryTable(rows)
@@ -1317,6 +1345,7 @@ elements.tableBody.addEventListener("click", async (event) => {
   const row = event.target.closest("[data-primary]")
   if (!row) return
   state.selectedPrimary = row.dataset.primary
+  state.selectedPrimaryLabel = row.dataset.label
   state.selectedSecondary = null
   state.detailRows = []
   renderPrimaryTable(state.primaryRows)

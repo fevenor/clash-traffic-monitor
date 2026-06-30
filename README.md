@@ -160,6 +160,9 @@ docker run -d \
 | `MIHOMO_URL` | 空 | 启动时优先使用的 Mihomo Controller 地址；未设置时可在页面首次打开后填写 |
 | `MIHOMO_SECRET` | 空 | Mihomo Bearer Token |
 | `TRAFFIC_MONITOR_LISTEN` | `:8080` | 服务监听地址 |
+| `OPENWRT_UBUS_URL` | 空 | OpenWrt ubus HTTP RPC 地址（如 `http://192.168.1.1/ubus`），未配置时设备身份解析功能关闭 |
+| `OPENWRT_UBUS_USERNAME` | 空 | ubus 账户用户名 |
+| `OPENWRT_UBUS_PASSWORD` | 空 | ubus 账户密码 |
 
 ## 自动切换
 
@@ -179,6 +182,49 @@ docker run -d \
   - 静默恢复时间按分钟桶计算，新的大流量触发会刷新等待时间。
   - 如果你在 Mihomo 里手动把策略组改到别的节点，待恢复任务会自动取消，避免覆盖人工操作。
   - 如果原始节点已经不在当前策略组选项里，系统会记录一次恢复失败事件，并清理对应恢复任务。
+
+## 设备身份解析
+
+设备身份解析通过 OpenWrt 的 ubus HTTP RPC 接口，将设备流量中的源 IP 解析为稳定的 MAC 地址和设备主机名（hostname），以 MAC 作为设备稳定唯一标识来归并同一设备多个 IP 的流量。
+
+- **解析链路**：IP → MAC → hostname，以 MAC 为锚点归并同设备多 IP 流量。
+- **展示方式**：有映射的设备显示 hostname + MAC（副行），无映射的设备显示原始 IP，两者混合共存。
+- **数据源**：同时调用 `luci-rpc.getHostHints`、`luci-rpc.getDHCPLeases`、`ip neigh`、`uci get dhcp` 四个源，取并集合并。
+- **hostname 优先级**：`uci` 静态租约名 > `getHostHints` > `getDHCPLeases`。
+- **降级行为**：路由器不可达时使用 `device_mappings` 表中的历史映射；无映射的 IP 显示原始 IP。
+- **功能开关**：未配置 `OPENWRT_UBUS_URL` 时功能完全关闭，行为与之前一致。
+
+### 环境变量
+
+| 变量名 | 默认值 | 说明 |
+| --- | --- | --- |
+| `OPENWRT_UBUS_URL` | 空 | OpenWrt ubus HTTP RPC 地址（如 `http://192.168.1.1/ubus`），配置后启用设备身份解析 |
+| `OPENWRT_UBUS_USERNAME` | 空 | ubus 账户用户名 |
+| `OPENWRT_UBUS_PASSWORD` | 空 | ubus 账户密码 |
+
+### ACL 权限要求
+
+ubus 账户需在 OpenWrt `/etc/config/rpcd` 中授权以下权限：
+
+- `luci-rpc` 对象：`read` 权限（用于 `getHostHints`、`getDHCPLeases`）
+- `file` 对象：`exec` 权限，白名单含 `/sbin/ip`（用于 `ip -[46] -j neigh show`）
+- `uci` 对象：`read` 权限（用于读取 DHCP 静态租约）
+
+### Docker 配置示例
+
+```bash
+docker run -d \
+  --name traffic-monitor \
+  --restart unless-stopped \
+  -p 8080:8080 \
+  -e MIHOMO_URL=http://host.docker.internal:9090 \
+  -e MIHOMO_SECRET=your-secret \
+  -e OPENWRT_UBUS_URL=http://192.168.1.1/ubus \
+  -e OPENWRT_UBUS_USERNAME=monitor \
+  -e OPENWRT_UBUS_PASSWORD=your-password \
+  -v "$(pwd)/data:/data" \
+  zhf883680/clash-traffic-monitor:latest
+```
 
 ## 存储策略
 
