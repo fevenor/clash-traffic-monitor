@@ -75,7 +75,7 @@ jobs:
           VERSION=${{ steps.version.outputs.version }}
           OUTPUT_NAME=traffic-monitor-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
           echo "Building $OUTPUT_NAME version $VERSION"
-          go build -ldflags="-s -w" -o "./$OUTPUT_NAME" main.go
+          go build -ldflags="-s -w" -o "./$OUTPUT_NAME" .
           chmod +x "./$OUTPUT_NAME" || true
 
       - name: Upload to Release
@@ -114,7 +114,7 @@ jobs:
             --platform linux/arm64 \
             golang:1.21-alpine \
             sh -c "apk add --no-cache gcc musl-dev && \
-                   CGO_ENABLED=1 go build -ldflags='-s -w' -o traffic-monitor-linux-arm64-musl main.go"
+                   CGO_ENABLED=1 go build -ldflags='-s -w' -o traffic-monitor-linux-arm64-musl ."
 
       - name: Upload to Release
         uses: softprops/action-gh-release@v2
@@ -158,7 +158,7 @@ jobs:
           VERSION=${{ steps.version.outputs.version }}
           OUTPUT_NAME=traffic-monitor-macos-arm64
           echo "Building $OUTPUT_NAME version $VERSION"
-          go build -ldflags="-s -w" -o "./$OUTPUT_NAME" main.go
+          go build -ldflags="-s -w" -o "./$OUTPUT_NAME" .
           chmod +x "./$OUTPUT_NAME"
 
       - name: Upload macOS binary to Release

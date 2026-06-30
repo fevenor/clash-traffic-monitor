@@ -60,7 +60,7 @@ jobs:
         run: |
           OUTPUT_NAME=traffic-monitor-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
           echo "Building $OUTPUT_NAME"
-          go build -ldflags="-s -w" -o "./$OUTPUT_NAME" main.go
+          go build -ldflags="-s -w" -o "./$OUTPUT_NAME" .
           chmod +x "./$OUTPUT_NAME" || true
 
       - name: Upload artifact
@@ -85,7 +85,7 @@ jobs:
             --platform linux/arm64 \
             golang:1.21-alpine \
             sh -c "apk add --no-cache gcc musl-dev && \
-                   CGO_ENABLED=1 go build -ldflags='-s -w' -o traffic-monitor-linux-arm64-musl main.go"
+                   CGO_ENABLED=1 go build -ldflags='-s -w' -o traffic-monitor-linux-arm64-musl ."
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -115,7 +115,7 @@ jobs:
         run: |
           OUTPUT_NAME=traffic-monitor-macos-arm64
           echo "Building $OUTPUT_NAME"
-          go build -ldflags="-s -w" -o "./$OUTPUT_NAME" main.go
+          go build -ldflags="-s -w" -o "./$OUTPUT_NAME" .
           chmod +x "./$OUTPUT_NAME"
 
       - name: Upload artifact

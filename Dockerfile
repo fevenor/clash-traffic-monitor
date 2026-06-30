@@ -7,11 +7,11 @@ RUN apk add --no-cache gcc musl-dev
 COPY go.mod go.sum ./
 RUN go mod download
 
-COPY main.go ./
+COPY *.go ./
 COPY LICENSE ./
 COPY web ./web
 
-RUN CGO_ENABLED=1 GOOS=linux go build -o traffic-monitor-enhanced main.go
+RUN CGO_ENABLED=1 GOOS=linux go build -o traffic-monitor-enhanced .
 
 FROM alpine:latest
 
