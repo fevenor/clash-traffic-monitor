@@ -348,10 +348,14 @@ func openDatabase(path string) (*sql.DB, error) {
 		return nil, err
 	}
 
-	db, err := sql.Open("sqlite3", path)
+	// DSN 参数让连接池中【每个新连接】都自动设置 busy_timeout 与 WAL，
+	// 避免 PRAGMA 仅对执行它的单个连接生效的陷阱；
+	// 单连接（SetMaxOpenConns(1)）彻底消除写并发锁冲突。
+	db, err := sql.Open("sqlite3", path+"?_busy_timeout=5000&_journal_mode=WAL")
 	if err != nil {
 		return nil, err
 	}
+	db.SetMaxOpenConns(1)
 
 	schema := `
 	PRAGMA journal_mode=WAL;
