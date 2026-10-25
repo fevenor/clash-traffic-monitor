@@ -2582,12 +2582,25 @@ func (s *service) handleSubstats(w http.ResponseWriter, r *http.Request) {
 	if dimension == "sourceIP" && s.ubusEnabled() && looksLikeMAC(label) {
 		ips := s.resolveMACToIPs(label, start, end)
 		if len(ips) > 0 {
-			data, err := s.querySubstatsByIPs(dimension, ips, start, end)
+			var data []aggregatedData
+			if r.URL.Query().Get("summary") == "1" {
+				// 汇总模式：summary 表覆盖 4 倍保留期窗口，raw 表仅补 summary
+				// 覆盖终点之后的部分，保证下钻数字与父级汇总行一致
+				data, err = s.querySummarySecondaryByIPs(ips, start, end)
+			} else {
+				data, err = s.querySubstatsByIPs(dimension, ips, start, end)
+			}
 			if err != nil {
 				writeError(w, http.StatusBadRequest, err)
 				return
 			}
 			writeJSON(w, http.StatusOK, data)
+			return
+		}
+		// 汇总模式下 MAC 解析不到关联 IP（如映射已被 retention 清理）：
+		// 直接返回空数组，避免把 MAC 当 IP 对 summary/raw 表做恒空查询
+		if r.URL.Query().Get("summary") == "1" {
+			writeJSON(w, http.StatusOK, []aggregatedData{})
 			return
 		}
 	}
@@ -3063,6 +3076,46 @@ func (s *service) querySummarySecondary(dimension, primary string, start, end in
 	}
 	mergeAggregatedDataRows(merged, detailRows)
 	mergeAggregatedDataRows(merged, s.queryByFiltersFromBuffer(bufferGroupColumn, bufferFilter, args, start, end))
+	return sortedAggregatedDataRows(merged), nil
+}
+
+// querySummarySecondaryByIPs 在汇总模式下按 MAC 反查出的多个源 IP 查询子统计。
+// 合并语义与 querySummaryByDimension / querySummarySecondary 一致：
+// summary 表覆盖 [start, end] 全窗口（4 倍保留期），raw 聚合表仅补 summary
+// 覆盖终点之后（fallbackStart = max(summaryCoveredEnd, start)）的部分，
+// 内存缓冲补 [start, end]，保证 MAC 下钻数字与父级汇总行一致。
+func (s *service) querySummarySecondaryByIPs(ips []string, start, end int64) ([]aggregatedData, error) {
+	placeholders := make([]string, len(ips))
+	args := make([]any, 0, len(ips))
+	for i, ip := range ips {
+		placeholders[i] = "?"
+		args = append(args, ip)
+	}
+	inList := strings.Join(placeholders, ",")
+
+	detailStart, err := s.summaryCoveredEnd()
+	if err != nil {
+		return nil, err
+	}
+	fallbackStart := detailStart
+	if fallbackStart < start {
+		fallbackStart = start
+	}
+
+	rows, err := s.querySummaryRows("source_ip", "secondary_label", " AND label IN ("+inList+")", args, start, end)
+	if err != nil {
+		return nil, err
+	}
+	merged := make(map[string]*aggregatedData)
+	mergeAggregatedDataRows(merged, rows)
+
+	bufferFilter := "source_ip IN (" + inList + ")"
+	detailRows, err := s.queryByFiltersFromAggregates("host", bufferFilter, args, fallbackStart, end)
+	if err != nil {
+		return nil, err
+	}
+	mergeAggregatedDataRows(merged, detailRows)
+	mergeAggregatedDataRows(merged, s.queryByFiltersFromBuffer("host", bufferFilter, args, start, end))
 	return sortedAggregatedDataRows(merged), nil
 }
 

@@ -230,6 +230,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   build-docker:
+    needs: [test-linux, test-windows]
     name: Build Docker Image (${{ matrix.arch }})
     runs-on: ubuntu-latest
     strategy:

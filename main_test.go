@@ -4868,3 +4868,160 @@ func TestExecuteAutoSwitchRespectsContextCancellation(t *testing.T) {
 		t.Fatalf("expected context.Canceled, got %v", err)
 	}
 }
+
+func TestSummarySubstatsMACDrilldownAlignsWithSummaryWindow(t *testing.T) {
+	svc := newTestService(t)
+	svc.ubusCli = &ubusClient{} // 非 nil 使 ubusEnabled 返回 true，MAC 反查分支生效
+	svc.deviceMappings = make(map[string]*deviceMapping)
+
+	day := int64(24 * time.Hour / time.Millisecond)
+	now := time.Date(2026, 8, 6, 15, 0, 0, 0, time.Local).UnixMilli()
+	dayStart := (now / day) * day
+	const mac = "AA:BB:CC:DD:EE:30"
+
+	insertDeviceMappings(t, svc.db, []deviceMapping{
+		{IP: "192.168.1.30", MAC: mac, Hostname: "dev-30", FirstSeen: dayStart - 90*day, LastSeen: now},
+	})
+
+	// 昨天的数据：先进 raw 表，backfill 后写入 summary 表，
+	// 再从 raw 表删除以模拟 retention 只保留近期数据的真实形态
+	// （此时 90 天窗口的旧数据只存在于 summary 表中）
+	insertTestAggregates(t, svc.db, []aggregatedEntry{
+		{
+			BucketStart: dayStart - day,
+			BucketEnd:   dayStart - day + 60000,
+			SourceIP:    "192.168.1.30",
+			Host:        "old.example.com",
+			Outbound:    "ProxyA",
+			Chains:      `["ProxyA"]`,
+			Upload:      10,
+			Download:    20,
+			Count:       1,
+		},
+	})
+	if err := backfillSummary(svc.db, now); err != nil {
+		t.Fatalf("backfillSummary: %v", err)
+	}
+	if _, err := svc.db.Exec(`DELETE FROM traffic_aggregated WHERE bucket_end < ?`, dayStart); err != nil {
+		t.Fatalf("delete old raw aggregates: %v", err)
+	}
+	// 今天的数据：仅存在于 raw 表（summary 未覆盖当天，靠 fallback 读取）
+	insertTestAggregates(t, svc.db, []aggregatedEntry{
+		{
+			BucketStart: dayStart,
+			BucketEnd:   dayStart + 60000,
+			SourceIP:    "192.168.1.30",
+			Host:        "old.example.com",
+			Outbound:    "ProxyB",
+			Chains:      `["ProxyB"]`,
+			Upload:      30,
+			Download:    40,
+			Count:       1,
+		},
+	})
+
+	// 汇总模式窗口（90 天，超出 raw 表 30 天保留期）
+	start := dayStart - 90*day
+	end := now
+
+	// 父级：汇总模式 sourceIP 维度 + MAC 归并后的设备行
+	parent, err := svc.querySummaryAggregate("sourceIP", start, end, false)
+	if err != nil {
+		t.Fatalf("querySummaryAggregate: %v", err)
+	}
+	parent = svc.applyDeviceLabelAndMACAggregate(parent, start, end)
+	var parentRow *aggregatedData
+	for i := range parent {
+		if parent[i].Mac == mac {
+			parentRow = &parent[i]
+			break
+		}
+	}
+	if parentRow == nil {
+		t.Fatalf("expected parent summary row for %s, got %+v", mac, parent)
+	}
+	if parentRow.Upload != 40 || parentRow.Download != 60 {
+		t.Fatalf("unexpected parent summary totals (want 40/60): %+v", parentRow)
+	}
+
+	// 子级：summary=1 + MAC 下钻，必须同时覆盖 summary 窗口与 raw 窗口
+	req := httptest.NewRequest(
+		http.MethodGet,
+		"/api/traffic/substats?dimension=sourceIP&label="+mac+
+			"&summary=1&start="+strconv.FormatInt(start, 10)+"&end="+strconv.FormatInt(end, 10),
+		nil,
+	)
+	rec := httptest.NewRecorder()
+	svc.routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("substats summary status: %d body=%s", rec.Code, rec.Body.String())
+	}
+	var rows []aggregatedData
+	if err := json.Unmarshal(rec.Body.Bytes(), &rows); err != nil {
+		t.Fatalf("decode substats summary: %v", err)
+	}
+	if len(rows) != 1 || rows[0].Label != "old.example.com" {
+		t.Fatalf("unexpected substats summary rows: %+v", rows)
+	}
+	// 旧窗口 10/20（仅 summary 表）+ 新窗口 30/40（仅 raw 表）= 40/60，
+	// 与父级汇总行完全一致；只读 raw 表的旧实现会得到残缺的 30/40
+	if rows[0].Upload != 40 || rows[0].Download != 60 || rows[0].Total != 100 || rows[0].Count != 2 {
+		t.Fatalf("expected merged summary+raw window (40/60/100), got %+v", rows[0])
+	}
+	if rows[0].Upload != parentRow.Upload || rows[0].Download != parentRow.Download {
+		t.Fatalf("child row %+v inconsistent with parent row %+v", rows[0], parentRow)
+	}
+}
+
+func TestSummarySubstatsMACDrilldownUnresolvableReturnsEmpty(t *testing.T) {
+	svc := newTestService(t)
+	svc.ubusCli = &ubusClient{}
+	svc.deviceMappings = make(map[string]*deviceMapping)
+
+	day := int64(24 * time.Hour / time.Millisecond)
+	now := time.Date(2026, 8, 6, 15, 0, 0, 0, time.Local).UnixMilli()
+	dayStart := (now / day) * day
+
+	// 表中存在其他设备的映射，但被查询的 MAC（老设备）已无任何关联 IP
+	insertDeviceMappings(t, svc.db, []deviceMapping{
+		{IP: "192.168.1.31", MAC: "AA:BB:CC:DD:EE:31", Hostname: "dev-31", FirstSeen: dayStart - day, LastSeen: now},
+	})
+	insertTestAggregates(t, svc.db, []aggregatedEntry{
+		{
+			BucketStart: dayStart - day,
+			BucketEnd:   dayStart - day + 60000,
+			SourceIP:    "192.168.1.31",
+			Host:        "api.example.com",
+			Outbound:    "ProxyA",
+			Chains:      `["ProxyA"]`,
+			Upload:      15,
+			Download:    25,
+			Count:       1,
+		},
+	})
+	if err := backfillSummary(svc.db, now); err != nil {
+		t.Fatalf("backfillSummary: %v", err)
+	}
+
+	req := httptest.NewRequest(
+		http.MethodGet,
+		"/api/traffic/substats?dimension=sourceIP&label=AA:BB:CC:DD:EE:99"+
+			"&summary=1&start="+strconv.FormatInt(dayStart-day, 10)+"&end="+strconv.FormatInt(now, 10),
+		nil,
+	)
+	rec := httptest.NewRecorder()
+	svc.routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("substats summary status: %d body=%s", rec.Code, rec.Body.String())
+	}
+	var rows []aggregatedData
+	if err := json.Unmarshal(rec.Body.Bytes(), &rows); err != nil {
+		t.Fatalf("decode substats summary: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("expected empty rows for unresolvable MAC, got %+v", rows)
+	}
+	if body := strings.TrimSpace(rec.Body.String()); body != "[]" {
+		t.Fatalf("expected empty JSON array, got %q", body)
+	}
+}
