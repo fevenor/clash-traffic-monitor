@@ -298,7 +298,7 @@ func newApplication(cfg config, dbPath string) (*application, error) {
 		filterDirectTraffic:    loadFilterDirectTraffic(db),
 		aggregateRetentionDays: loadRetentionDays(db),
 		lastConnections:        make(map[string]connection),
-		lastVacuum:             time.Time{},
+		lastVacuum:             time.Now(),
 		aggregateBuffer:        make(map[string]*aggregatedEntry),
 		hostMinuteWindows:      make(map[string]*hostTrafficWindow),
 	}
