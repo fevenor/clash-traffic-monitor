@@ -32,6 +32,10 @@ type ubusClient struct {
 	mu       sync.Mutex
 	token    string
 	client   *http.Client
+
+	// reloginMu 实现 token 过期时的「单一并发重登」（single-flight）：
+	// 同一时刻只有一个 goroutine 真正发起重新登录，其余等待后直接复用新 token。
+	reloginMu sync.Mutex
 }
 
 // ubusRPCRequest is a JSON-RPC 2.0 request for ubus.
@@ -167,6 +171,28 @@ func (u *ubusClient) login() (string, error) {
 	return loginResult.Token, nil
 }
 
+// reloginExpired 在 token 过期时执行「单一并发重登」：
+// staleToken 是调用方发现过期的旧 token。拿到 reloginMu 后先复查当前
+// token——若已被其他并发请求换新则直接复用，跳过登录；否则由当前
+// goroutine 执行唯一的重新登录。效果：同一过期时刻并发请求只会触发
+// 一次 session.login 与一条重登日志，其余请求等待后复用新 token 重试。
+func (u *ubusClient) reloginExpired(staleToken string) error {
+	u.reloginMu.Lock()
+	defer u.reloginMu.Unlock()
+
+	u.mu.Lock()
+	current := u.token
+	u.mu.Unlock()
+	if current != staleToken {
+		// 其他并发请求已完成重登，直接复用新 token
+		return nil
+	}
+
+	log.Printf("ubus token 过期，重新登录并重试")
+	_, err := u.login()
+	return err
+}
+
 // doCall 执行一次 ubus RPC call，返回结果数据（result 数组第二元素）。
 // 若 RPC 层返回错误，返回 rpcErr。
 func (u *ubusClient) doCall(token, object, method string, params map[string]any) (json.RawMessage, *ubusRPCError, error) {
@@ -243,14 +269,11 @@ func (u *ubusClient) call(object, method string, params map[string]any) (json.Ra
 			return nil, err
 		}
 
-		// token 过期（-32002），自动重登并重试
+		// token 过期（-32002），自动重登并重试（单一并发重登）
 		if rpcErr != nil && rpcErr.Code == -32002 && attempt == 0 {
-			log.Printf("ubus token 过期，重新登录并重试")
-			newToken, loginErr := u.login()
-			if loginErr != nil {
+			if loginErr := u.reloginExpired(token); loginErr != nil {
 				return nil, fmt.Errorf("ubus 重新登录失败: %w", loginErr)
 			}
-			token = newToken
 			continue
 		}
 

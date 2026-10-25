@@ -3,6 +3,7 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sort"
@@ -1504,5 +1505,101 @@ func TestHandleAggregateRawDoesNotApplyDeviceLabel(t *testing.T) {
 	// raw=1 时设备 label 增强仍然应用（设备增强与域名分组是两个维度）
 	if len(result) != 1 || result[0].Mac != "AA:BB:CC:DD:EE:01" {
 		t.Fatalf("expected MAC-enhanced result even with raw=1, got %+v", result)
+	}
+}
+
+func TestUbusTokenExpiredReloginSingleFlight(t *testing.T) {
+	var (
+		mu         sync.Mutex
+		loginCount int
+		validToken string
+	)
+
+	ubusServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req ubusRPCRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode request: %v", err)
+			return
+		}
+		object, method := "", ""
+		token := "00000000000000000000000000000000"
+		if len(req.Params) >= 3 {
+			if s, ok := req.Params[0].(string); ok {
+				token = s
+			}
+			object, _ = req.Params[1].(string)
+			method, _ = req.Params[2].(string)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if object == "session" && method == "login" {
+			mu.Lock()
+			loginCount++
+			validToken = fmt.Sprintf("fresh-token-%d", loginCount)
+			tokenToReturn := validToken
+			mu.Unlock()
+			// 模拟登录耗时，放大并发请求撞上重登的窗口
+			time.Sleep(20 * time.Millisecond)
+			json.NewEncoder(w).Encode(map[string]any{
+				"jsonrpc": "2.0", "id": req.ID,
+				"result": []any{0, map[string]any{"ubus_rpc_session": tokenToReturn}},
+			})
+			return
+		}
+		mu.Lock()
+		current := validToken
+		mu.Unlock()
+		if token != current {
+			// 模拟会话过期：返回 JSON-RPC 错误 -32002
+			json.NewEncoder(w).Encode(map[string]any{
+				"jsonrpc": "2.0", "id": req.ID,
+				"error": map[string]any{"code": -32002, "message": "Invalid session identifier"},
+			})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"jsonrpc": "2.0", "id": req.ID,
+			"result": []any{0, map[string]any{}},
+		})
+	}))
+	defer ubusServer.Close()
+
+	svc := newTestServiceWithUbus(t, ubusServer.URL)
+	// 预置一个"已过期"的 token，使首批并发调用全部命中 -32002
+	svc.ubusCli.mu.Lock()
+	svc.ubusCli.token = "stale-token"
+	svc.ubusCli.mu.Unlock()
+
+	const concurrency = 8
+	var wg sync.WaitGroup
+	errs := make([]error, concurrency)
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			_, err := svc.ubusCli.call("luci-rpc", "getHostHints", nil)
+			errs[idx] = err
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("goroutine %d call failed: %v", i, err)
+		}
+	}
+
+	mu.Lock()
+	got := loginCount
+	mu.Unlock()
+	if got != 1 {
+		t.Fatalf("并发 token 过期应只触发 1 次重登（single-flight），实际 %d 次", got)
+	}
+
+	// 重登后的新 token 应被所有请求复用
+	svc.ubusCli.mu.Lock()
+	finalToken := svc.ubusCli.token
+	svc.ubusCli.mu.Unlock()
+	if finalToken != "fresh-token-1" {
+		t.Fatalf("expected cached token fresh-token-1, got %q", finalToken)
 	}
 }
