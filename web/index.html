@@ -20,15 +20,21 @@
               <button class="dimension-tab active" type="button" data-dimension="sourceIP">设备</button>
               <button class="dimension-tab" type="button" data-dimension="host">主机</button>
               <button class="dimension-tab" type="button" data-dimension="outbound">代理</button>
+              <button class="dimension-tab" type="button" data-dimension="rule">规则</button>
             </div>
             <select id="dimension" class="hidden-select" aria-hidden="true" tabindex="-1">
               <option value="sourceIP">设备</option>
               <option value="host">目标主机</option>
               <option value="outbound">出口节点</option>
+              <option value="rule">规则分组</option>
             </select>
           </div>
 
           <div class="toolbar">
+            <div class="mode-switch" role="group" aria-label="展示模式">
+              <button class="mode-tab active" type="button" data-mode="detail">细节</button>
+              <button class="mode-tab" type="button" data-mode="summary">汇总</button>
+            </div>
             <div class="toolbar-group">
               <div class="toolbar-field">
                 <label for="range">范围</label>
@@ -147,6 +153,13 @@
                 <span>域名分组</span>
                 <label class="switch">
                   <input id="domainGroupingEnabled" type="checkbox" />
+                  <span class="switch-slider"></span>
+                </label>
+              </label>
+              <label class="settings-field switch-field">
+                <span title="开启后命中直连的流量不再写入统计，历史数据不受影响">过滤 DIRECT 直连流量</span>
+                <label class="switch">
+                  <input id="filterDirectTraffic" type="checkbox" />
                   <span class="switch-slider"></span>
                 </label>
               </label>
@@ -366,6 +379,7 @@
                 </table>
               </div>
             </div>
+            <div id="secondaryChart" class="secondary-chart hidden" aria-live="polite"></div>
           </section>
 
           <section class="panel detail-panel">
@@ -382,7 +396,7 @@
         </section>
 
         <footer class="panel site-footer">
-          <div class="footer-text">开源协议：MIT · 版本：v2.2.3</div>
+          <div class="footer-text">开源协议：MIT · 版本：v2.6.0</div>
           <div class="footer-links">
             <a
               class="footer-link"

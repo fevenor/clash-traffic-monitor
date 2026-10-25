@@ -24,8 +24,8 @@
 - 改动 `web/` 静态资源后，必须重新编译二进制才会生效（资源是 `//go:embed LICENSE web/*` 编译期内嵌的）。
 
 ```bash
-# 构建（默认 CGO_ENABLED=1，需本机有 gcc）
-go build -o traffic-monitor main.go
+# 构建（默认 CGO_ENABLED=1，需本机有 gcc；整包构建，不要只编 main.go）
+go build -o traffic-monitor .
 
 # 运行全部测试（同样需要 CGO + gcc）
 go test ./...
@@ -157,7 +157,7 @@ go test ./... -run TestAutoRestore -run "restore happens after quiet minutes"
 
 ## 发布版本
 
-- 当前版本：`v2.2.3`（见 `web/index.html` 页脚 `版本：v2.2.3`）。
+- 当前版本：`v2.6.0`（见 `web/index.html` 页脚 `版本：v2.6.0`）。
 - 发布时保持 git tag 与页脚版本字符串一致，tag 加 `v` 前缀。
 - 升版本时同步修改 `web/index.html` 页脚的版本字符串，再打对应 tag。
 - 发布产物由 `.github/workflows/release.yml` 构建（linux amd64/arm64、linux arm64 musl、windows amd64、macos arm64、多架构 Docker 镜像）。

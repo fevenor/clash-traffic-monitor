@@ -38,13 +38,17 @@
 
 ## 功能特性
 
-- 按域名、IP、节点、代理等维度查看流量，方便快速定位异常流量来源。
+- 按域名、IP、节点、代理、规则等维度查看流量，方便快速定位异常流量来源。
 - 可以直观看到连接是否走代理，辅助你调整 Mihomo / Clash 规则。
+- 新增“规则”维度：直接复用 Mihomo 每个连接命中的 Clash 规则（如 `geosite:telegram`、`geoip:CN`），把裸 IP 归到规则分组下，避免只看到 `91.108.56.108` 这类难以识别的地址。
 - 支持按 1 分钟窗口检测异常大流量域名，并自动把选定策略组切换到预设节点。
 - 支持在大流量结束后按静默时间自动恢复到原始节点，并记录恢复结果。
+- 支持“细节 / 汇总”前端展示切换；汇总模式只读取按天预聚合的紧凑数据，不展示连接明细，适合大流量长时间部署。
+- 支持过滤直连流量：开启后命中 `DIRECT` 的连接不再计入统计，避免直连流量干扰代理与规则维度的观察。
 - 使用分钟级聚合落盘到 SQLite，磁盘占用更可控，查询也更直接。
 - 提供内置 Web 页面，无需额外部署前端服务或数据库。
 - 支持本地二进制直接运行，也支持 Docker 部署，适合单机和 OpenWrt 场景。
+- Windows 版本提供系统托盘与开机自动启动；Linux、macOS 与 Docker 保持无界面的服务形态。
 
 ## 项目现状
 
@@ -78,6 +82,18 @@
 .\traffic-monitor-windows-amd64.exe
 ```
 
+Windows 版本是托盘程序：双击后没有控制台窗口，只在通知区域出现一个图标，右键托盘图标可以使用：
+
+- `打开统计页`：用默认浏览器打开实际监听地址对应的页面。
+- `开机自动启动`：写入当前用户的注册表 `HKCU\...\Run`，不需要管理员权限；程序移动位置后需要重新勾选一次。
+- `退出`：停止采集、把内存中的聚合数据落盘后退出。
+
+Windows 使用约定：
+
+- 数据库和日志固定放在 exe 旁边的 `data` 目录（`traffic_monitor.db`、`traffic-monitor.log`，日志按 5 MiB 轮转并保留一份备份），与启动时的工作目录无关。旧版本放在工作目录下的数据库会在首次运行时自动迁移到新位置，旧文件保留作备份。
+- 同一个登录会话内只运行一个实例；重复双击不会报端口错误，只会打开已运行实例的统计页。
+- 通过托盘退出会完成刷盘；用任务管理器强制结束仍可能丢失最近最多 10 分钟未刷盘的数据。
+
 #### Linux
 
 下载文件：
@@ -107,7 +123,7 @@ chmod +x ./traffic-monitor-macos-arm64
 如果你是从源码本地编译，也可以直接这样运行：
 
 ```bash
-go build -o traffic-monitor main.go
+go build -o traffic-monitor .
 ./traffic-monitor
 ```
 
@@ -123,6 +139,12 @@ http://localhost:8080/
 - `Secret`（如果 Mihomo 没有设置密钥，可以留空）
 
 保存后会立即生效，并持久化到本地 SQLite。后续也可以在页面右上角继续修改这两个值。
+
+页面右上角「设置」里还可以调整：
+
+- `域名分组`：把子域名归并到主域名展示。
+- `过滤 DIRECT 直连流量`：开启后链路上出现 `DIRECT` 的连接不再写入统计，趋势、总量和各维度都不再包含直连流量，历史数据不受影响。
+- `日志保留天数`：本地聚合数据的保留时长。
 
 ### Docker 运行
 
@@ -224,11 +246,16 @@ docker run -d \
 
 - 只把分钟级聚合数据写入 `traffic_aggregated`，不再持久化逐条原始连接日志。
 - 聚合数据固定保留 30 天。
-- 本地直接运行时，默认数据库文件是 `./data/traffic_monitor.db`。
+- 本地直接运行时（Linux/macOS），默认数据库文件是 `./data/traffic_monitor.db`；Windows 下固定为 exe 旁边的 `data\traffic_monitor.db`。
 - Docker 容器内运行时，默认数据库文件是 `/data/traffic_monitor.db`。
 - 采集增量先进入内存缓冲，每 10 分钟批量刷盘一次。
 - 正常运行时，页面查询会把已落盘聚合数据和当前内存缓冲一起合并，所以最近几分钟也能查到。
 - 如果服务异常退出，最近最多 10 分钟、尚未刷盘的数据可能丢失。
+- 后台会持续把已完成的天级聚合写入 `traffic_summary`，只保留设备、主机、代理及二级维度，不包含连接明细。
+- `traffic_summary` 的保留天数为“日志保留天数” × 4；数据库清理时会同步执行 WAL checkpoint，避免 WAL 文件长期膨胀。除每小时清理外，运行期每 5 分钟还会做一次轻量 WAL checkpoint，把高流量场景下 WAL 文件的峰值控制在较小范围。
+- 原始连接日志表只保留写入负担最小的索引，并且每小时清空；页面查询全部走分钟聚合表，原始日志量不会拖慢页面。
+- 聚合表的时间范围查询强制走 bucket 索引，查询耗时只跟所选时间范围有关，不会随表总行数（日志量）线性膨胀。
+- 升级后首次清理会自动执行一次 WAL checkpoint 和 VACUUM，用于回收旧版本遗留的主库与 WAL 空间。
 
 ## 项目定位
 
@@ -253,3 +280,6 @@ docker run -d \
 
 - 页面接口参考了 [MetaCubeX/metacubexd](https://github.com/MetaCubeX/metacubexd)。
 - [LinuxDO](https://linux.do) - the community where it all began
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=zhf883680/clash-traffic-monitor&type=Date)](https://star-history.com/#zhf883680/clash-traffic-monitor&Date)

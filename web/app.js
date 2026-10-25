@@ -23,10 +23,20 @@ const drilldownConfig = {
     buildDetailTitle: (primary, secondary) =>
       primary && secondary ? `${primary} / ${secondary} 的连接明细` : "连接明细",
   },
+  rule: {
+    countLabel: "规则",
+    primaryTitle: "规则排行",
+    secondaryColumn: "目标主机",
+    buildSecondaryTitle: (primary) => (primary ? `${primary} 命中的目标主机` : "目标主机"),
+    buildDetailTitle: (primary, secondary) =>
+      primary && secondary ? `${primary} / ${secondary} 的连接明细` : "连接明细",
+  },
 }
 
 const DIMENSION_STORAGE_KEY = "traffic-monitor:selected-dimension"
 const RANGE_STORAGE_KEY = "traffic-monitor:selected-range"
+const MODE_STORAGE_KEY = "traffic-monitor:display-mode"
+const MAX_LIST_ROWS = 50
 const autoSwitchStatusLabels = {
   switched: "已切换目标节点",
   skipped: "无需切换",
@@ -42,6 +52,7 @@ const elements = {
   range: document.getElementById("range"),
   start: document.getElementById("start"),
   end: document.getElementById("end"),
+  modeTabs: Array.from(document.querySelectorAll(".mode-tab")),
   statusBanner: document.getElementById("statusBanner"),
   runtimeSummary: document.getElementById("runtimeSummary"),
   selectionPath: document.getElementById("selectionPath"),
@@ -61,6 +72,7 @@ const elements = {
   settingsCancelBtn: document.getElementById("settingsCancelBtn"),
   domainGroupingEnabled: document.getElementById("domainGroupingEnabled"),
   retentionDays: document.getElementById("retentionDays"),
+  filterDirectTraffic: document.getElementById("filterDirectTraffic"),
   settingsCloseBtn: document.getElementById("settingsCloseBtn"),
   settingsBtn: document.getElementById("settingsBtn"),
   autoSwitchBtn: document.getElementById("autoSwitchBtn"),
@@ -95,6 +107,7 @@ const elements = {
   detailTitle: document.getElementById("detailTitle"),
   detailSearch: document.getElementById("detailSearch"),
   secondaryBody: document.getElementById("secondaryBody"),
+  secondaryChart: document.getElementById("secondaryChart"),
   detailCards: document.getElementById("detailCards"),
 }
 
@@ -116,7 +129,10 @@ const state = {
     secret: "",
   },
   domainGroupingEnabled: false,
+  filterDirectTraffic: false,
   retentionDays: 30,
+  summaryRangeDays: 120,
+  mode: "detail",
   settingsOpen: false,
   settingsRequired: false,
   autoSwitchOpen: false,
@@ -170,6 +186,26 @@ function persistSelectedRange(value) {
     window.localStorage.setItem(RANGE_STORAGE_KEY, value)
   } catch (error) {
     console.warn("Failed to persist selected range", error)
+  }
+}
+
+function loadStoredMode() {
+  try {
+    const value = window.localStorage.getItem(MODE_STORAGE_KEY)
+    return value === "summary" || value === "detail" ? value : null
+  } catch (error) {
+    console.warn("Failed to load stored mode", error)
+    return null
+  }
+}
+
+function persistSelectedMode(value) {
+  if (value !== "summary" && value !== "detail") return
+
+  try {
+    window.localStorage.setItem(MODE_STORAGE_KEY, value)
+  } catch (error) {
+    console.warn("Failed to persist selected mode", error)
   }
 }
 
@@ -270,12 +306,51 @@ function currentRangeLabel() {
   return `最近 ${label}`
 }
 
+function syncModeUI() {
+  document.body.classList.toggle("summary-mode", state.mode === "summary")
+  elements.modeTabs.forEach((tab) => {
+    tab.classList.toggle("active", tab.dataset.mode === state.mode)
+  })
+  if (elements.secondaryChart) {
+    elements.secondaryChart.classList.toggle("hidden", state.mode !== "summary")
+  }
+  syncRangeOptions()
+}
+
+function syncRangeOptions() {
+  state.summaryRangeDays = Math.max(1, Math.min(1460, Math.round(state.retentionDays * 4)))
+  let summaryOption = elements.range.querySelector("option[data-summary-range]")
+  if (!summaryOption) {
+    summaryOption = document.createElement("option")
+    summaryOption.dataset.summaryRange = "1"
+    elements.range.add(summaryOption)
+  }
+  summaryOption.value = String(state.summaryRangeDays * 86400000)
+  summaryOption.textContent = `${state.summaryRangeDays} 天`
+  summaryOption.disabled = state.mode !== "summary"
+  if (state.mode === "summary") {
+    summaryOption.selected = true
+  } else if (summaryOption.selected) {
+    elements.range.value = "604800000"
+  }
+  updateCustomInputs()
+}
+
+function applyMode(mode) {
+  if (mode !== "detail" && mode !== "summary") return
+  state.mode = mode
+  syncModeUI()
+  resetDetailPanels()
+}
+
 function bucketSize(start, end) {
   const range = end - start
-  if (range <= 3600000) return 60000
-  if (range <= 86400000) return 300000
-  if (range <= 604800000) return 3600000
-  return 86400000
+  let size = 60000
+  if (range <= 3600000) size = 60000
+  else if (range <= 86400000) size = 300000
+  else if (range <= 604800000) size = 3600000
+  else size = 86400000
+  return state.mode === "summary" ? Math.max(86400000, size) : size
 }
 
 function formatBytes(bytes) {
@@ -440,6 +515,7 @@ function syncSettingsForm() {
   elements.settingsUrl.value = state.mihomoSettings.url || ""
   elements.settingsSecret.value = state.mihomoSettings.secret || ""
   elements.domainGroupingEnabled.checked = Boolean(state.domainGroupingEnabled)
+  elements.filterDirectTraffic.checked = Boolean(state.filterDirectTraffic)
   elements.retentionDays.value = state.retentionDays
 }
 
@@ -662,9 +738,10 @@ function collectAutoSwitchGroupTargets() {
 }
 
 async function loadSettings() {
-  const [settings, grouping, retention] = await Promise.all([
+  const [settings, grouping, directFilter, retention] = await Promise.all([
     fetchJSON("/api/settings/mihomo"),
     fetchJSON("/api/settings/domain-grouping"),
+    fetchJSON("/api/settings/direct-traffic-filter"),
     fetchJSON("/api/settings/retention"),
   ])
   state.mihomoSettings = {
@@ -672,7 +749,9 @@ async function loadSettings() {
     secret: settings.secret || "",
   }
   state.domainGroupingEnabled = Boolean(grouping.enabled)
+  state.filterDirectTraffic = Boolean(directFilter.enabled)
   state.retentionDays = retention.days || 30
+  syncModeUI()
   state.settingsRequired = !state.mihomoSettings.url
   state.settingsOpen = state.settingsRequired
   syncSettingsForm()
@@ -724,6 +803,7 @@ async function saveSettings(event) {
     secret: elements.settingsSecret.value.trim(),
   }
   const groupingPayload = { enabled: elements.domainGroupingEnabled.checked }
+  const directFilterPayload = { enabled: elements.filterDirectTraffic.checked }
   const retentionDays = Math.max(1, Math.min(365, Number(elements.retentionDays.value) || 30))
   const retentionPayload = { days: retentionDays }
 
@@ -734,6 +814,7 @@ async function saveSettings(event) {
     const [saved] = await Promise.all([
       sendJSON("/api/settings/mihomo", "PUT", mihomoPayload),
       sendJSON("/api/settings/domain-grouping", "PUT", groupingPayload),
+      sendJSON("/api/settings/direct-traffic-filter", "PUT", directFilterPayload),
       sendJSON("/api/settings/retention", "PUT", retentionPayload),
     ])
     state.mihomoSettings = {
@@ -741,6 +822,7 @@ async function saveSettings(event) {
       secret: saved.secret || "",
     }
     state.domainGroupingEnabled = groupingPayload.enabled
+    state.filterDirectTraffic = directFilterPayload.enabled
     state.retentionDays = retentionDays
     state.settingsRequired = !state.mihomoSettings.url
     state.settingsOpen = false
@@ -804,13 +886,22 @@ function renderCards(rows) {
 }
 
 function renderPrimaryTable(rows) {
+  if (state.mode === "summary") {
+    renderPrimaryChart(rows)
+    return
+  }
+
   if (!rows.length) {
     elements.tableBody.innerHTML = '<div class="empty">当前时间范围内没有数据</div>'
     return
   }
 
-  elements.tableBody.innerHTML = rows
-    .slice(0, 120)
+  const visibleRows = rows.slice(0, MAX_LIST_ROWS)
+  const truncated = rows.length > MAX_LIST_ROWS
+  const limitNote = truncated
+    ? `<div class="list-limit-note">仅显示前 ${MAX_LIST_ROWS} 条</div>`
+    : ""
+  elements.tableBody.innerHTML = visibleRows
     .map((row, index) => {
       // data-primary: use mac if available (for API dril ldown), else label (raw IP)
       const primaryValue = row.mac || row.label
@@ -847,7 +938,36 @@ function renderPrimaryTable(rows) {
         </div>
       `
     })
-    .join("")
+    .join("") + limitNote
+}
+
+function renderPrimaryChart(rows) {
+  if (!rows.length) {
+    elements.tableBody.innerHTML = '<div class="empty">当前时间范围内没有数据</div>'
+    return
+  }
+
+  const maxTotal = Math.max(...rows.map((row) => row.total), 1)
+  const visibleRows = rows.slice(0, MAX_LIST_ROWS)
+  const truncated = rows.length > MAX_LIST_ROWS
+  const limitNote = truncated
+    ? `<div class="list-limit-note">仅显示前 ${MAX_LIST_ROWS} 条</div>`
+    : ""
+  elements.tableBody.innerHTML = visibleRows
+    .map((row, index) => {
+      const width = Math.max(2, Math.round((row.total / maxTotal) * 100))
+      const active = state.selectedPrimary === row.label ? " active" : ""
+      return `
+        <div class="secondary-chart-row primary-chart-row${active}" tabindex="0" data-primary="${escapeHTML(row.label)}">
+          <span class="secondary-chart-rank">${index + 1}</span>
+          <span class="secondary-chart-label mono">${renderTruncatedText(row.label, "host", "-")}</span>
+          <span class="secondary-chart-bar" aria-hidden="true"><i style="width:${width}%"></i></span>
+          <span class="secondary-chart-value mono">${formatBytes(row.total)}</span>
+          <span class="secondary-chart-meta">↑ ${formatBytes(row.upload)} · ↓ ${formatBytes(row.download)}</span>
+        </div>
+      `
+    })
+    .join("") + limitNote
 }
 
 function renderSecondaryTable(rows) {
@@ -855,14 +975,23 @@ function renderSecondaryTable(rows) {
     row.label.toLowerCase().includes(state.detailSearchQuery.toLowerCase()),
   )
 
+  if (state.mode === "summary") {
+    renderSecondaryChart(filteredRows)
+    return
+  }
+
   if (!filteredRows.length) {
     const emptyText = state.selectedPrimary ? "当前分组下没有二级数据" : "选择左侧分组后加载"
     elements.secondaryBody.innerHTML = `<tr><td colspan="5" class="empty">${emptyText}</td></tr>`
     return
   }
 
-  elements.secondaryBody.innerHTML = filteredRows
-    .slice(0, 120)
+  const visibleRows = filteredRows.slice(0, MAX_LIST_ROWS)
+  const truncated = filteredRows.length > MAX_LIST_ROWS
+  const limitNote = truncated
+    ? `<tr><td colspan="5" class="list-limit-note">仅显示前 ${MAX_LIST_ROWS} 条</td></tr>`
+    : ""
+  elements.secondaryBody.innerHTML = visibleRows
     .map((row, index) => {
       const active = state.selectedSecondary === row.label ? " active" : ""
       return `
@@ -875,7 +1004,36 @@ function renderSecondaryTable(rows) {
         </tr>
       `
     })
-    .join("")
+    .join("") + limitNote
+}
+
+function renderSecondaryChart(rows) {
+  if (!rows.length) {
+    elements.secondaryChart.innerHTML =
+      '<div class="detail-empty">当前分组下没有二级数据</div>'
+    return
+  }
+
+  const maxTotal = Math.max(...rows.map((row) => row.total), 1)
+  const visibleRows = rows.slice(0, MAX_LIST_ROWS)
+  const truncated = rows.length > MAX_LIST_ROWS
+  const limitNote = truncated
+    ? `<div class="list-limit-note">仅显示前 ${MAX_LIST_ROWS} 条</div>`
+    : ""
+  elements.secondaryChart.innerHTML = visibleRows
+    .map((row, index) => {
+      const width = Math.max(2, Math.round((row.total / maxTotal) * 100))
+      return `
+        <div class="secondary-chart-row">
+          <span class="secondary-chart-rank">${index + 1}</span>
+          <span class="secondary-chart-label mono">${renderTruncatedText(row.label, "host", "-")}</span>
+          <span class="secondary-chart-bar" aria-hidden="true"><i style="width:${width}%"></i></span>
+          <span class="secondary-chart-value mono">${formatBytes(row.total)}</span>
+          <span class="secondary-chart-meta">↑ ${formatBytes(row.upload)} · ↓ ${formatBytes(row.download)}</span>
+        </div>
+      `
+    })
+    .join("") + limitNote
 }
 
 function renderDetails(rows) {
@@ -889,8 +1047,12 @@ function renderDetails(rows) {
     return
   }
 
-  const cards = rows
-    .slice(0, 120)
+  const visibleCards = rows.slice(0, MAX_LIST_ROWS)
+  const truncated = rows.length > MAX_LIST_ROWS
+  const limitNote = truncated
+    ? `<div class="list-limit-note">仅显示前 ${MAX_LIST_ROWS} 条</div>`
+    : ""
+  const cards = visibleCards
     .map((row) => {
       const chips = (row.chains || [])
         .map((item) => `<span class="chip route">${escapeHTML(item)}</span>`)
@@ -918,7 +1080,7 @@ function renderDetails(rows) {
     })
     .join("")
 
-  elements.detailCards.innerHTML = `<div class="detail-card-grid">${cards}</div>`
+  elements.detailCards.innerHTML = `<div class="detail-card-grid">${cards}</div>${limitNote}`
 }
 
 function hideTrendTooltip() {
@@ -1137,17 +1299,18 @@ async function loadSecondaryRows(primaryLabel) {
 
   let path = "/api/traffic/substats"
   let params
+  const summary = state.mode === "summary" ? "1" : ""
   let subdomainMode = false
   if (dimension === "host") {
     if (state.domainGroupingEnabled) {
       subdomainMode = true
-      params = { dimension: "host", label: primaryLabel, start, end }
+      params = { dimension: "host", label: primaryLabel, start, end, summary }
     } else {
       path = "/api/traffic/devices-by-host"
-      params = { host: primaryLabel, start, end }
+      params = { host: primaryLabel, start, end, summary }
     }
   } else {
-    params = { dimension, label: primaryLabel, start, end }
+    params = { dimension, label: primaryLabel, start, end, summary }
   }
 
   const rows = await fetchJSON(path, params)
@@ -1156,7 +1319,7 @@ async function loadSecondaryRows(primaryLabel) {
   renderSecondaryTable(rows)
   updateViewHints()
 
-  if (state.selectedSecondary) {
+  if (state.selectedSecondary && state.mode !== "summary") {
     await loadDetails(primaryLabel, state.selectedSecondary)
   } else {
     state.detailRows = []
@@ -1216,6 +1379,7 @@ async function loadData() {
   const seq = ++state.loadSeq
   setStatus("加载中...")
   elements.refreshBtn.disabled = true
+  const summary = state.mode === "summary" ? "1" : ""
 
   try {
     resetDetailPanels()
@@ -1225,11 +1389,13 @@ async function loadData() {
         dimension: elements.dimension.value,
         start,
         end,
+        summary,
       }),
       fetchJSON("/api/traffic/trend", {
         start,
         end,
         bucket: bucketSize(start, end),
+        summary,
       }),
     ])
 
@@ -1263,6 +1429,16 @@ async function loadData() {
     elements.refreshBtn.disabled = false
   }
 }
+
+elements.modeTabs.forEach((tab) => {
+  tab.addEventListener("click", () => {
+    const mode = tab.dataset.mode
+    if (mode === state.mode) return
+    applyMode(mode)
+    persistSelectedMode(mode)
+    loadData()
+  })
+})
 
 elements.range.addEventListener("change", () => {
   if (Number(elements.range.value) !== -1) updateCustomInputs()
@@ -1411,6 +1587,14 @@ async function initializeApp() {
     persistSelectedRange(elements.range.value)
   }
 
+  const storedMode = loadStoredMode()
+  if (storedMode) {
+    state.mode = storedMode
+  } else {
+    persistSelectedMode(state.mode)
+  }
+
+  syncModeUI()
   updateCustomInputs()
   updateViewHints()
   renderCards([])

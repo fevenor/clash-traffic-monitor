@@ -13,7 +13,55 @@ env:
   APP_DIR: .
 
 jobs:
+  test-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Install C compiler
+        run: sudo apt-get update && sudo apt-get install -y gcc
+
+      - name: Test
+        env:
+          CGO_ENABLED: "1"
+        run: |
+          go test ./...
+          go vet ./...
+
+  test-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Use preinstalled mingw toolchain
+        shell: pwsh
+        run: |
+          if (-not (Test-Path 'C:\mingw64\bin\gcc.exe')) { throw 'preinstalled mingw64 toolchain not found' }
+          Add-Content $env:GITHUB_PATH 'C:\mingw64\bin'
+          gcc --version
+
+      - name: Test
+        env:
+          CGO_ENABLED: "1"
+          CC: gcc
+        run: go test ./...
+
   build-and-upload:
+    needs: [test-linux, test-windows]
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -23,16 +71,19 @@ jobs:
             goarch: amd64
             cc: gcc
             ext: ""
+            ldflags: "-s -w"
           - target: binary
             goos: linux
             goarch: arm64
             cc: aarch64-linux-gnu-gcc
             ext: ""
+            ldflags: "-s -w"
           - target: binary
             goos: windows
             goarch: amd64
             cc: x86_64-w64-mingw32-gcc
             ext: ".exe"
+            ldflags: "-s -w -H=windowsgui"
 
     steps:
       - uses: actions/checkout@v4
@@ -75,8 +126,16 @@ jobs:
           VERSION=${{ steps.version.outputs.version }}
           OUTPUT_NAME=traffic-monitor-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
           echo "Building $OUTPUT_NAME version $VERSION"
-          go build -ldflags="-s -w" -o "./$OUTPUT_NAME" .
+          go build -ldflags="${{ matrix.ldflags }}" -o "./$OUTPUT_NAME" .
           chmod +x "./$OUTPUT_NAME" || true
+
+      - name: Verify Windows GUI subsystem
+        if: matrix.target == 'binary' && matrix.goos == 'windows'
+        run: |
+          x86_64-w64-mingw32-objdump -p ./traffic-monitor-windows-amd64.exe | grep -q "Subsystem.*Windows GUI" || {
+            echo "windows binary is not a GUI subsystem binary"
+            exit 1
+          }
 
       - name: Upload to Release
         if: matrix.target == 'binary'
@@ -87,6 +146,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   build-musl-arm64:
+    needs: [test-linux, test-windows]
     runs-on: ubuntu-latest
 
     steps:
@@ -124,6 +184,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   build-macos-arm64:
+    needs: [test-linux, test-windows]
     runs-on: macos-latest
 
     steps:

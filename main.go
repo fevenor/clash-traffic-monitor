@@ -13,13 +13,11 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -32,12 +30,18 @@ const (
 	defaultListenAddr      = ":8080"
 	defaultPollInterval    = 5 * time.Second
 	aggregateFlushInterval = 10 * time.Minute
-	defaultRetentionDays  = 30
-	defaultAllowedOrigin   = "*"
+	summaryBucketSize      = int64(24 * time.Hour / time.Millisecond)
+	summaryBuildInterval   = 10 * time.Minute
+	defaultRetentionDays   = 30
+	// Keep the WAL file bounded between hourly TRUNCATE checkpoints; with high
+	// write volume (5s polls, per-connection deltas) the WAL can otherwise grow
+	// to hundreds of MB, which slows every read that must merge it.
+	walCheckpointInterval = 5 * time.Minute
+	defaultAllowedOrigin  = "*"
 
 	// Device identity resolution constants
-	deviceMappingRefreshInterval   = 5 * time.Minute
-	deviceMappingDebounceInterval  = 30 * time.Second
+	deviceMappingRefreshInterval  = 5 * time.Minute
+	deviceMappingDebounceInterval = 30 * time.Second
 	deviceMappingPeriodicInterval = 5 * time.Minute
 )
 
@@ -46,13 +50,17 @@ var isContainerRuntime = func() bool {
 	return err == nil
 }
 
+// collectorShutdownTimeout bounds the wait for the collector goroutine during
+// shutdown. It is a variable so tests can shorten it.
+var collectorShutdownTimeout = 5 * time.Second
+
 type config struct {
-	ListenAddr       string
-	MihomoURL        string
-	MihomoSecret     string
-	UbusURL          string
-	UbusUsername     string
-	UbusPassword     string
+	ListenAddr   string
+	MihomoURL    string
+	MihomoSecret string
+	UbusURL      string
+	UbusUsername string
+	UbusPassword string
 }
 
 type mihomoSettings struct {
@@ -117,6 +125,7 @@ type trafficLog struct {
 	Process       string   `json:"process"`
 	Outbound      string   `json:"outbound"`
 	Chains        []string `json:"chains"`
+	RuleGroup     string   `json:"-"`
 	Upload        int64    `json:"upload"`
 	Download      int64    `json:"download"`
 }
@@ -136,7 +145,6 @@ type trendPoint struct {
 	Download  int64 `json:"download"`
 }
 
-
 type connectionDetail struct {
 	DestinationIP string   `json:"destinationIP"`
 	SourceIP      string   `json:"sourceIP"`
@@ -150,11 +158,13 @@ type connectionDetail struct {
 }
 
 type connection struct {
-	ID       string   `json:"id"`
-	Upload   int64    `json:"upload"`
-	Download int64    `json:"download"`
-	Chains   []string `json:"chains"`
-	Metadata struct {
+	ID          string   `json:"id"`
+	Upload      int64    `json:"upload"`
+	Download    int64    `json:"download"`
+	Chains      []string `json:"chains"`
+	Rule        string   `json:"rule"`
+	RulePayload string   `json:"rulePayload"`
+	Metadata    struct {
 		SourceIP      string `json:"sourceIP"`
 		Host          string `json:"host"`
 		DestinationIP string `json:"destinationIP"`
@@ -179,30 +189,33 @@ type mihomoProxiesResponse struct {
 }
 
 type service struct {
-	db                    *sql.DB
-	client                *http.Client
-	now                   func() time.Time
-	cfg                   config
-	mu                    sync.Mutex
-	mihomoSettings        mihomoSettings
-	domainGroupingEnabled bool
-	lastConnections       map[string]connection
-	lastUploadTotal       int64
-	lastDownloadTotal     int64
-	lastAutoSwitchAt      int64
-	lastAutoSwitchMin     int64
-	lastCleanup           time.Time
-	lastVacuum            time.Time
-	aggregateBuffer       map[string]*aggregatedEntry
-	hostMinuteWindows     map[string]*hostTrafficWindow
+	db                     *sql.DB
+	client                 *http.Client
+	now                    func() time.Time
+	cfg                    config
+	mu                     sync.Mutex
+	mihomoSettings         mihomoSettings
+	domainGroupingEnabled  bool
+	filterDirectTraffic    bool
+	lastConnections        map[string]connection
+	lastUploadTotal        int64
+	lastDownloadTotal      int64
+	lastAutoSwitchAt       int64
+	lastAutoSwitchMin      int64
+	lastCleanup            time.Time
+	lastVacuum             time.Time
+	lastCheckpoint         time.Time
+	lastSummaryBuild       time.Time
+	aggregateBuffer        map[string]*aggregatedEntry
+	hostMinuteWindows      map[string]*hostTrafficWindow
 	aggregateRetentionDays int
 
 	// Device identity resolution
-	ubusCli             *ubusClient
-	deviceMappings      map[string]*deviceMapping
-	deviceMappingMu     sync.RWMutex
-	deviceRefreshMu     sync.Mutex
-	lastDeviceRefresh   time.Time
+	ubusCli           *ubusClient
+	deviceMappings    map[string]*deviceMapping
+	deviceMappingMu   sync.RWMutex
+	deviceRefreshMu   sync.Mutex
+	lastDeviceRefresh time.Time
 }
 
 type aggregatedEntry struct {
@@ -214,6 +227,7 @@ type aggregatedEntry struct {
 	Process       string
 	Outbound      string
 	Chains        string
+	RuleGroup     string
 	Upload        int64
 	Download      int64
 	Count         int64
@@ -225,38 +239,74 @@ type hostTrafficWindow struct {
 	TotalBytes  int64
 }
 
+// application owns the runtime components (database, service, HTTP server and
+// collector) so that every platform entrypoint can start them and later stop
+// them through one idempotent shutdown path.
+type application struct {
+	cfg           config
+	db            *sql.DB
+	svc           *service
+	server        *http.Server
+	listener      net.Listener
+	ctx           context.Context
+	cancel        context.CancelFunc
+	collectorDone chan struct{}
+	serverErr     chan error
+	shutdownOnce  sync.Once
+	shutdownErr   error
+}
+
 func main() {
-	cfg, err := loadConfig()
+	if err := runPlatform(); err != nil {
+		reportPlatformFatal(err)
+		os.Exit(1)
+	}
+}
+
+func newApplication(cfg config, dbPath string) (*application, error) {
+	db, err := openDatabase(dbPath)
 	if err != nil {
-		log.Fatalf("load config: %v", err)
+		return nil, err
 	}
 
-	db, err := openDatabase(defaultDatabasePath())
-	if err != nil {
-		log.Fatalf("open database: %v", err)
+	app := &application{
+		cfg:           cfg,
+		db:            db,
+		collectorDone: make(chan struct{}),
+		serverErr:     make(chan error, 1),
 	}
-	defer db.Close()
+
+	closeDBOnError := func(cause error) (*application, error) {
+		if closeErr := db.Close(); closeErr != nil {
+			log.Printf("close database after failed startup: %v", closeErr)
+		}
+		return nil, cause
+	}
 
 	runtimeSettings, err := resolveMihomoSettings(db, cfg.MihomoURL, cfg.MihomoSecret)
 	if err != nil {
-		log.Fatalf("resolve mihomo settings: %v", err)
+		return closeDBOnError(fmt.Errorf("resolve mihomo settings: %w", err))
 	}
 
-	domainGroupingEnabled := loadDomainGroupingEnabled(db)
+	listener, err := net.Listen("tcp", cfg.ListenAddr)
+	if err != nil {
+		return closeDBOnError(fmt.Errorf("listen on %s: %w", cfg.ListenAddr, err))
+	}
 
 	svc := &service{
-		db:                    db,
-		client:                &http.Client{Timeout: 10 * time.Second},
-		now:                   time.Now,
-		cfg:                   cfg,
-		mihomoSettings:        runtimeSettings,
-		domainGroupingEnabled: domainGroupingEnabled,
+		db:                     db,
+		client:                 &http.Client{Timeout: 10 * time.Second},
+		now:                    time.Now,
+		cfg:                    cfg,
+		mihomoSettings:         runtimeSettings,
+		domainGroupingEnabled:  loadDomainGroupingEnabled(db),
+		filterDirectTraffic:    loadFilterDirectTraffic(db),
 		aggregateRetentionDays: loadRetentionDays(db),
-		lastConnections:       make(map[string]connection),
-		lastVacuum:            time.Now(),
-		aggregateBuffer:       make(map[string]*aggregatedEntry),
-		hostMinuteWindows:     make(map[string]*hostTrafficWindow),
-		deviceMappings:        make(map[string]*deviceMapping),
+		lastConnections:        make(map[string]connection),
+		lastVacuum:             time.Time{},
+		aggregateBuffer:        make(map[string]*aggregatedEntry),
+		hostMinuteWindows:      make(map[string]*hostTrafficWindow),
+		deviceMappings:         make(map[string]*deviceMapping),
 	}
 
 	// 初始化 ubus 客户端（仅在 OPENWRT_UBUS_URL 配置时）
@@ -275,52 +325,90 @@ func main() {
 		}
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	collectorDone := make(chan struct{})
-	go func() {
-		defer close(collectorDone)
-		svc.runCollector(ctx)
-	}()
-
-	// 启动定期设备映射刷新（仅在 ubus 已配置时）
-	if svc.ubusEnabled() {
-		go svc.runPeriodicDeviceRefresh(ctx)
-	}
-
-	server := &http.Server{
-		Addr:              cfg.ListenAddr,
+	app.svc = svc
+	app.listener = listener
+	app.server = &http.Server{
 		Handler:           svc.routes(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
+	app.ctx, app.cancel = context.WithCancel(context.Background())
 
+	return app, nil
+}
+
+func (a *application) start() {
+	collectorDone := a.collectorDone
 	go func() {
-		log.Printf("traffic monitor listening on %s", cfg.ListenAddr)
-		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatalf("http server: %v", err)
-		}
+		defer close(collectorDone)
+		a.svc.runCollector(a.ctx)
 	}()
 
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	<-sigCh
-
-	cancel()
-	select {
-	case <-collectorDone:
-	case <-time.After(5 * time.Second):
-		log.Printf("collector shutdown timed out")
-	}
-	if err := svc.flushAggregateBuffer(); err != nil {
-		log.Printf("flush aggregate buffer on shutdown: %v", err)
+	// 启动定期设备映射刷新（仅在 ubus 已配置时）
+	if a.svc.ubusEnabled() {
+		go a.svc.runPeriodicDeviceRefresh(a.ctx)
 	}
 
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer shutdownCancel()
-	if err := server.Shutdown(shutdownCtx); err != nil {
+	go func() {
+		log.Printf("traffic monitor listening on %s", a.cfg.ListenAddr)
+		if err := a.server.Serve(a.listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			select {
+			case a.serverErr <- fmt.Errorf("http server: %w", err):
+			default:
+			}
+		}
+	}()
+}
+
+func (a *application) errors() <-chan error {
+	return a.serverErr
+}
+
+func (a *application) shutdown() error {
+	a.shutdownOnce.Do(func() {
+		a.shutdownErr = a.shutdownApplication()
+	})
+	return a.shutdownErr
+}
+
+func (a *application) shutdownApplication() error {
+	a.cancel()
+
+	var errs []error
+
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelShutdown()
+	if err := a.server.Shutdown(shutdownCtx); err != nil {
 		log.Printf("shutdown server: %v", err)
+		errs = append(errs, fmt.Errorf("shutdown server: %w", err))
 	}
+
+	select {
+	case <-a.collectorDone:
+	case <-time.After(collectorShutdownTimeout):
+		log.Printf("collector shutdown timed out")
+		errs = append(errs, errors.New("collector shutdown timed out"))
+	}
+
+	if len(errs) > 0 {
+		// HTTP handlers or the collector are still running; flushing or closing
+		// the database now would race with them. Process exit closes the DB.
+		errs = append(errs, errors.New("skipping final flush and database close: shutdown deadline exceeded"))
+		return errors.Join(errs...)
+	}
+
+	if err := a.svc.flushAggregateBuffer(); err != nil {
+		log.Printf("flush aggregate buffer on shutdown: %v", err)
+		errs = append(errs, fmt.Errorf("flush aggregate buffer: %w", err))
+	}
+	if err := backfillSummary(a.db, time.Now().UnixMilli()); err != nil {
+		log.Printf("build traffic summary on shutdown: %v", err)
+		errs = append(errs, fmt.Errorf("build traffic summary: %w", err))
+	}
+	if err := a.db.Close(); err != nil {
+		log.Printf("close database on shutdown: %v", err)
+		errs = append(errs, fmt.Errorf("close database: %w", err))
+	}
+	return errors.Join(errs...)
 }
 
 func loadConfig() (config, error) {
@@ -370,6 +458,7 @@ func openDatabase(path string) (*sql.DB, error) {
 		process TEXT NOT NULL,
 		outbound TEXT NOT NULL,
 		chains TEXT NOT NULL DEFAULT '[]',
+		rule_group TEXT NOT NULL DEFAULT 'unknown',
 		upload INTEGER NOT NULL,
 		download INTEGER NOT NULL
 	);
@@ -384,23 +473,39 @@ func openDatabase(path string) (*sql.DB, error) {
 		process TEXT NOT NULL,
 		outbound TEXT NOT NULL,
 		chains TEXT NOT NULL DEFAULT '[]',
+		rule_group TEXT NOT NULL DEFAULT 'unknown',
 		upload INTEGER NOT NULL,
 		download INTEGER NOT NULL,
 		count INTEGER NOT NULL,
 		UNIQUE(bucket_start, bucket_end, source_ip, host, destination_ip, process, outbound, chains)
 	);
 
+	-- Only the timestamp index on traffic_logs is ever read (startup backfill);
+	-- the other per-column indexes only amplified write cost for a write-only table.
 	CREATE INDEX IF NOT EXISTS idx_traffic_logs_timestamp ON traffic_logs(timestamp);
-	CREATE INDEX IF NOT EXISTS idx_traffic_logs_source_ip ON traffic_logs(source_ip);
-	CREATE INDEX IF NOT EXISTS idx_traffic_logs_host ON traffic_logs(host);
-	CREATE INDEX IF NOT EXISTS idx_traffic_logs_process ON traffic_logs(process);
-	CREATE INDEX IF NOT EXISTS idx_traffic_logs_outbound ON traffic_logs(outbound);
 
 	CREATE INDEX IF NOT EXISTS idx_traffic_aggregated_bucket ON traffic_aggregated(bucket_start, bucket_end);
 	CREATE INDEX IF NOT EXISTS idx_traffic_aggregated_source_ip ON traffic_aggregated(source_ip);
 	CREATE INDEX IF NOT EXISTS idx_traffic_aggregated_host ON traffic_aggregated(host);
 	CREATE INDEX IF NOT EXISTS idx_traffic_aggregated_process ON traffic_aggregated(process);
 	CREATE INDEX IF NOT EXISTS idx_traffic_aggregated_outbound ON traffic_aggregated(outbound);
+
+	CREATE TABLE IF NOT EXISTS traffic_summary (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		bucket_start INTEGER NOT NULL,
+		bucket_end INTEGER NOT NULL,
+		dimension TEXT NOT NULL,
+		label TEXT NOT NULL,
+		secondary_label TEXT NOT NULL DEFAULT '',
+		upload INTEGER NOT NULL,
+		download INTEGER NOT NULL,
+		count INTEGER NOT NULL,
+		UNIQUE(bucket_start, bucket_end, dimension, label, secondary_label)
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_traffic_summary_bucket ON traffic_summary(bucket_start, bucket_end);
+	CREATE INDEX IF NOT EXISTS idx_traffic_summary_dimension_label ON traffic_summary(dimension, label, bucket_start, bucket_end);
+	CREATE INDEX IF NOT EXISTS idx_traffic_summary_secondary_label ON traffic_summary(dimension, secondary_label, bucket_start, bucket_end);
 
 	CREATE TABLE IF NOT EXISTS app_settings (
 		key TEXT PRIMARY KEY,
@@ -455,6 +560,8 @@ func openDatabase(path string) (*sql.DB, error) {
 	for _, stmt := range []string{
 		`ALTER TABLE traffic_logs ADD COLUMN destination_ip TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE traffic_logs ADD COLUMN chains TEXT NOT NULL DEFAULT '[]'`,
+		`ALTER TABLE traffic_logs ADD COLUMN rule_group TEXT NOT NULL DEFAULT 'unknown'`,
+		`ALTER TABLE traffic_aggregated ADD COLUMN rule_group TEXT NOT NULL DEFAULT 'unknown'`,
 	} {
 		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
 			db.Close()
@@ -462,8 +569,66 @@ func openDatabase(path string) (*sql.DB, error) {
 		}
 	}
 
+	// rule_group indexes must be created after the ALTER migrations above:
+	// legacy databases do not have the column yet, and CREATE INDEX runs in the
+	// schema block would fail before the ALTER could add it.
+	for _, stmt := range []string{
+		`CREATE INDEX IF NOT EXISTS idx_traffic_aggregated_rule_group ON traffic_aggregated(rule_group)`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			db.Close()
+			return nil, err
+		}
+	}
+
+	// Drop legacy traffic_logs per-column indexes (source_ip/host/process/outbound/
+	// rule_group). traffic_logs is write-only in production — the page reads
+	// traffic_aggregated — so these indexes only amplified write amplification.
+	for _, idx := range []string{
+		"idx_traffic_logs_source_ip",
+		"idx_traffic_logs_host",
+		"idx_traffic_logs_process",
+		"idx_traffic_logs_outbound",
+		"idx_traffic_logs_rule_group",
+	} {
+		if _, err := db.Exec(`DROP INDEX IF EXISTS ` + idx); err != nil {
+			db.Close()
+			return nil, err
+		}
+	}
+
+	// One-time re-label (user_version 0 -> 1): rows persisted before rule
+	// capture got the "match" default. Re-label them to the hidden "unknown"
+	// sentinel so legacy data disappears from the 规则 view while a real
+	// catch-all MATCH rule (which is also labelled "match") stays visible.
+	var userVersion int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&userVersion); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if userVersion < 1 {
+		for _, stmt := range []string{
+			`UPDATE traffic_logs SET rule_group = '` + unknownRuleGroup + `' WHERE rule_group = 'match'`,
+			`UPDATE traffic_aggregated SET rule_group = '` + unknownRuleGroup + `' WHERE rule_group = 'match'`,
+			`UPDATE traffic_summary SET label = '` + unknownRuleGroup + `' WHERE dimension = 'rule' AND label = 'match'`,
+		} {
+			if _, err := db.Exec(stmt); err != nil {
+				db.Close()
+				return nil, err
+			}
+		}
+		if _, err := db.Exec(`PRAGMA user_version = 1`); err != nil {
+			db.Close()
+			return nil, err
+		}
+	}
+
 	currentBucketStart := (time.Now().UnixMilli() / 60000) * 60000
 	if err := backfillAggregatedLogs(db, currentBucketStart); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if err := backfillSummary(db, time.Now().UnixMilli()); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -549,6 +714,28 @@ func saveDomainGroupingEnabled(db *sql.DB, enabled bool) error {
 	_, err := db.Exec(`
 		INSERT INTO app_settings (key, value)
 		VALUES ('domain_grouping_enabled', ?)
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value
+	`, value)
+	return err
+}
+
+func loadFilterDirectTraffic(db *sql.DB) bool {
+	var value string
+	err := db.QueryRow(`SELECT value FROM app_settings WHERE key = 'filter_direct_traffic'`).Scan(&value)
+	if err != nil {
+		return false // default off
+	}
+	return value == "true"
+}
+
+func saveFilterDirectTraffic(db *sql.DB, enabled bool) error {
+	value := "false"
+	if enabled {
+		value = "true"
+	}
+	_, err := db.Exec(`
+		INSERT INTO app_settings (key, value)
+		VALUES ('filter_direct_traffic', ?)
 		ON CONFLICT(key) DO UPDATE SET value = excluded.value
 	`, value)
 	return err
@@ -882,12 +1069,12 @@ func normalizeProxyGroupType(raw string) string {
 	}
 }
 
-func (s *service) listControllableProxyGroups(settings mihomoSettings) ([]controllableProxyGroup, error) {
+func (s *service) listControllableProxyGroups(ctx context.Context, settings mihomoSettings) ([]controllableProxyGroup, error) {
 	if settings.URL == "" {
 		return nil, errors.New("mihomo url is not configured")
 	}
 
-	req, err := http.NewRequest(http.MethodGet, settings.URL+"/proxies", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, settings.URL+"/proxies", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -937,7 +1124,7 @@ func (s *service) listControllableProxyGroups(settings mihomoSettings) ([]contro
 	return groups, nil
 }
 
-func (s *service) switchProxyGroup(settings mihomoSettings, group controllableProxyGroup, targetProxy string) error {
+func (s *service) switchProxyGroup(ctx context.Context, settings mihomoSettings, group controllableProxyGroup, targetProxy string) error {
 	group.Type = normalizeProxyGroupType(group.Type)
 	if group.Type == "" {
 		return errors.New("proxy group type is not controllable")
@@ -956,7 +1143,7 @@ func (s *service) switchProxyGroup(settings mihomoSettings, group controllablePr
 		return err
 	}
 
-	req, err := http.NewRequest(http.MethodPut, settings.URL+"/proxies/"+group.Name, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, settings.URL+"/proxies/"+group.Name, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -1002,7 +1189,7 @@ func backfillAggregatedLogs(db *sql.DB, beforeMS int64) error {
 
 	_, err := db.Exec(`
 		INSERT INTO traffic_aggregated
-		(bucket_start, bucket_end, source_ip, host, destination_ip, process, outbound, chains, upload, download, count)
+		(bucket_start, bucket_end, source_ip, host, destination_ip, process, outbound, chains, rule_group, upload, download, count)
 		SELECT ((timestamp / 60000) * 60000) AS bucket_start,
 		       ((timestamp / 60000) * 60000) + 60000 AS bucket_end,
 		       source_ip,
@@ -1011,6 +1198,7 @@ func backfillAggregatedLogs(db *sql.DB, beforeMS int64) error {
 		       process,
 		       outbound,
 		       chains,
+		       rule_group,
 		       COALESCE(SUM(upload), 0) AS upload,
 		       COALESCE(SUM(download), 0) AS download,
 		       COUNT(*) AS count
@@ -1023,6 +1211,100 @@ func backfillAggregatedLogs(db *sql.DB, beforeMS int64) error {
 			download = excluded.download,
 			count = excluded.count
 	`, startMS, beforeMS)
+	return err
+}
+
+func backfillSummary(db *sql.DB, beforeMS int64) error {
+	if beforeMS <= 0 {
+		return nil
+	}
+
+	var lastBucketEnd sql.NullInt64
+	if err := db.QueryRow(`SELECT MAX(bucket_end) FROM traffic_summary`).Scan(&lastBucketEnd); err != nil {
+		return err
+	}
+
+	startMS := int64(0)
+	if lastBucketEnd.Valid {
+		startMS = lastBucketEnd.Int64
+	}
+	endExclusive := (beforeMS / summaryBucketSize) * summaryBucketSize
+	if startMS >= endExclusive {
+		return nil
+	}
+
+	_, err := db.Exec(`
+		INSERT INTO traffic_summary
+		(bucket_start, bucket_end, dimension, label, secondary_label, upload, download, count)
+		SELECT ((bucket_start / ?) * ?) AS bucket_start,
+		       ((bucket_start / ?) * ?) + ? AS bucket_end,
+		       'source_ip',
+		       source_ip,
+		       host,
+		       COALESCE(SUM(upload), 0) AS upload,
+		       COALESCE(SUM(download), 0) AS download,
+		       COALESCE(SUM(count), 0) AS count
+		FROM traffic_aggregated
+		WHERE bucket_start >= ? AND bucket_start < ?
+		GROUP BY ((bucket_start / ?) * ?), source_ip, host
+
+		UNION ALL
+
+		SELECT ((bucket_start / ?) * ?) AS bucket_start,
+		       ((bucket_start / ?) * ?) + ? AS bucket_end,
+		       'outbound',
+		       outbound,
+		       host,
+		       COALESCE(SUM(upload), 0) AS upload,
+		       COALESCE(SUM(download), 0) AS download,
+		       COALESCE(SUM(count), 0) AS count
+		FROM traffic_aggregated
+		WHERE bucket_start >= ? AND bucket_start < ?
+		GROUP BY ((bucket_start / ?) * ?), outbound, host
+
+		UNION ALL
+
+		SELECT ((bucket_start / ?) * ?) AS bucket_start,
+		       ((bucket_start / ?) * ?) + ? AS bucket_end,
+		       'rule',
+		       rule_group,
+		       host,
+		       COALESCE(SUM(upload), 0) AS upload,
+		       COALESCE(SUM(download), 0) AS download,
+		       COALESCE(SUM(count), 0) AS count
+		FROM traffic_aggregated
+		WHERE bucket_start >= ? AND bucket_start < ?
+		GROUP BY ((bucket_start / ?) * ?), rule_group, host
+
+		UNION ALL
+
+		SELECT ((bucket_start / ?) * ?) AS bucket_start,
+		       ((bucket_start / ?) * ?) + ? AS bucket_end,
+		       'total',
+		       'total',
+		       '',
+		       COALESCE(SUM(upload), 0) AS upload,
+		       COALESCE(SUM(download), 0) AS download,
+		       COALESCE(SUM(count), 0) AS count
+		FROM traffic_aggregated
+		WHERE bucket_start >= ? AND bucket_start < ?
+		GROUP BY ((bucket_start / ?) * ?)
+
+		ON CONFLICT(bucket_start, bucket_end, dimension, label, secondary_label)
+		DO UPDATE SET
+			upload = excluded.upload,
+			download = excluded.download,
+			count = excluded.count
+	`, summaryBucketSize, summaryBucketSize, summaryBucketSize, summaryBucketSize, summaryBucketSize,
+		startMS, endExclusive, summaryBucketSize, summaryBucketSize,
+		summaryBucketSize, summaryBucketSize, summaryBucketSize, summaryBucketSize, summaryBucketSize,
+		startMS, endExclusive, summaryBucketSize, summaryBucketSize,
+		summaryBucketSize, summaryBucketSize, summaryBucketSize, summaryBucketSize, summaryBucketSize,
+		startMS, endExclusive, summaryBucketSize, summaryBucketSize,
+		summaryBucketSize, summaryBucketSize, summaryBucketSize, summaryBucketSize, summaryBucketSize,
+		startMS, endExclusive, summaryBucketSize, summaryBucketSize,
+		summaryBucketSize, summaryBucketSize, summaryBucketSize, summaryBucketSize, summaryBucketSize,
+		startMS, endExclusive, summaryBucketSize, summaryBucketSize)
 	return err
 }
 
@@ -1054,7 +1336,7 @@ func (s *service) collectOnce(ctx context.Context) {
 		return
 	}
 
-	if err := s.processConnections(resp); err != nil {
+	if err := s.processConnections(ctx, resp); err != nil {
 		log.Printf("process connections: %v", err)
 	}
 }
@@ -1101,6 +1383,22 @@ func (s *service) updateDomainGroupingEnabled(enabled bool) error {
 	}
 	s.mu.Lock()
 	s.domainGroupingEnabled = enabled
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *service) currentFilterDirectTraffic() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.filterDirectTraffic
+}
+
+func (s *service) updateFilterDirectTraffic(enabled bool) error {
+	if err := saveFilterDirectTraffic(s.db, enabled); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.filterDirectTraffic = enabled
 	s.mu.Unlock()
 	return nil
 }
@@ -1165,7 +1463,7 @@ func (s *service) currentTime() time.Time {
 	return time.Now()
 }
 
-func (s *service) processConnections(payload *connectionsResponse) error {
+func (s *service) processConnections(ctx context.Context, payload *connectionsResponse) error {
 	now := s.currentTime()
 	nowMS := now.UnixMilli()
 
@@ -1204,6 +1502,14 @@ func (s *service) processConnections(payload *connectionsResponse) error {
 			continue
 		}
 
+		if s.filterDirectTraffic && isDirectConnection(conn.Chains) {
+			// Direct traffic is dropped from statistics while the filter is on.
+			// The baseline snapshot still advances so that turning the filter
+			// off later does not replay the skipped bytes as a single spike.
+			s.lastConnections[conn.ID] = conn
+			continue
+		}
+
 		logs = append(logs, trafficLog{
 			Timestamp:     nowMS,
 			SourceIP:      defaultString(conn.Metadata.SourceIP, "Inner"),
@@ -1212,6 +1518,7 @@ func (s *service) processConnections(payload *connectionsResponse) error {
 			Process:       defaultString(conn.Metadata.Process, "Unknown"),
 			Outbound:      outboundName(conn.Chains),
 			Chains:        sanitizeChains(conn.Chains),
+			RuleGroup:     ruleGroupLabel(conn.Rule, conn.RulePayload),
 			Upload:        uploadDelta,
 			Download:      downloadDelta,
 		})
@@ -1241,16 +1548,24 @@ func (s *service) processConnections(payload *connectionsResponse) error {
 		if err := s.addToAggregateBuffer(logs, nowMS); err != nil {
 			return err
 		}
-		if err := s.evaluateAutoSwitch(logs, nowMS); err != nil {
+		if err := s.evaluateAutoSwitch(ctx, logs, nowMS); err != nil {
 			log.Printf("auto switch evaluation: %v", err)
 		}
 	}
-	if err := s.evaluateAutoRestore(nowMS); err != nil {
+	if err := s.evaluateAutoRestore(ctx, nowMS); err != nil {
 		log.Printf("auto restore evaluation: %v", err)
 	}
 
 	if err := s.flushCompletedAggregateBuckets(nowMS); err != nil {
 		log.Printf("flush aggregate buffer: %v", err)
+	}
+
+	if time.Since(s.lastSummaryBuild) >= summaryBuildInterval {
+		if err := backfillSummary(s.db, nowMS); err != nil {
+			log.Printf("build traffic summary: %v", err)
+		} else {
+			s.lastSummaryBuild = now
+		}
 	}
 
 	if now.Sub(s.lastCleanup) >= time.Hour {
@@ -1261,10 +1576,18 @@ func (s *service) processConnections(payload *connectionsResponse) error {
 		}
 	}
 
+	if now.Sub(s.lastCheckpoint) >= walCheckpointInterval {
+		if _, err := s.db.Exec(`PRAGMA wal_checkpoint(PASSIVE)`); err != nil {
+			log.Printf("wal checkpoint: %v", err)
+		} else {
+			s.lastCheckpoint = now
+		}
+	}
+
 	return nil
 }
 
-func (s *service) evaluateAutoSwitch(logs []trafficLog, nowMS int64) error {
+func (s *service) evaluateAutoSwitch(ctx context.Context, logs []trafficLog, nowMS int64) error {
 	settings, err := loadAutoSwitchSettings(s.db)
 	if err != nil {
 		return err
@@ -1297,7 +1620,7 @@ func (s *service) evaluateAutoSwitch(logs []trafficLog, nowMS int64) error {
 		return nil
 	}
 
-	results, execErr := s.executeAutoSwitch(settings, enabledTargets[triggerGroup], nowMS, triggerHost, triggerTotal)
+	results, execErr := s.executeAutoSwitch(ctx, settings, enabledTargets[triggerGroup], nowMS, triggerHost, triggerTotal)
 	event := autoSwitchEvent{
 		TriggeredAt: nowMS,
 		Host:        triggerHost,
@@ -1414,6 +1737,7 @@ func (s *service) autoSwitchSuppressionReason(bucketStart, nowMS, cooldownSecond
 }
 
 func (s *service) executeAutoSwitch(
+	ctx context.Context,
 	settings autoSwitchSettings,
 	target autoSwitchGroupTarget,
 	triggeredAt int64,
@@ -1421,7 +1745,7 @@ func (s *service) executeAutoSwitch(
 	triggerTotal int64,
 ) ([]autoSwitchExecutionResult, error) {
 	mihomo := s.currentMihomoSettings()
-	groups, err := s.listControllableProxyGroups(mihomo)
+	groups, err := s.listControllableProxyGroups(ctx, mihomo)
 	if err != nil {
 		return nil, err
 	}
@@ -1435,6 +1759,7 @@ func (s *service) executeAutoSwitch(
 	results := make([]autoSwitchExecutionResult, 0, 1)
 	visited := make(map[string]struct{})
 	return s.executeAutoSwitchChain(
+		ctx,
 		settings,
 		mihomo,
 		groupByName,
@@ -1449,6 +1774,7 @@ func (s *service) executeAutoSwitch(
 }
 
 func (s *service) executeAutoSwitchChain(
+	ctx context.Context,
 	settings autoSwitchSettings,
 	mihomo mihomoSettings,
 	groupByName map[string]controllableProxyGroup,
@@ -1506,6 +1832,7 @@ func (s *service) executeAutoSwitchChain(
 			}
 		}
 		return s.continueAutoSwitchChainIfNeeded(
+			ctx,
 			settings,
 			mihomo,
 			groupByName,
@@ -1519,7 +1846,7 @@ func (s *service) executeAutoSwitchChain(
 		)
 	}
 
-	if err := s.switchProxyGroup(mihomo, group, target.TargetProxy); err != nil {
+	if err := s.switchProxyGroup(ctx, mihomo, group, target.TargetProxy); err != nil {
 		log.Printf("auto switch debug: switch failed group=%q from=%q to=%q host=%q total=%d err=%v",
 			target.GroupName, group.Now, target.TargetProxy, triggerHost, triggerTotal, err)
 		results = append(results, autoSwitchExecutionResult{
@@ -1559,6 +1886,7 @@ func (s *service) executeAutoSwitchChain(
 	group.Now = target.TargetProxy
 	groupByName[target.GroupName] = group
 	return s.continueAutoSwitchChainIfNeeded(
+		ctx,
 		settings,
 		mihomo,
 		groupByName,
@@ -1573,6 +1901,7 @@ func (s *service) executeAutoSwitchChain(
 }
 
 func (s *service) continueAutoSwitchChainIfNeeded(
+	ctx context.Context,
 	settings autoSwitchSettings,
 	mihomo mihomoSettings,
 	groupByName map[string]controllableProxyGroup,
@@ -1590,6 +1919,7 @@ func (s *service) continueAutoSwitchChainIfNeeded(
 	}
 
 	return s.executeAutoSwitchChain(
+		ctx,
 		settings,
 		mihomo,
 		groupByName,
@@ -1613,7 +1943,7 @@ func autoRestoreEligible(nowMS, lastTriggeredAt, quietMinutes int64) bool {
 	return currentBucketStart >= triggerBucketStart+quietMinutes*60000
 }
 
-func (s *service) evaluateAutoRestore(nowMS int64) error {
+func (s *service) evaluateAutoRestore(ctx context.Context, nowMS int64) error {
 	settings, err := loadAutoSwitchSettings(s.db)
 	if err != nil {
 		return err
@@ -1641,7 +1971,7 @@ func (s *service) evaluateAutoRestore(nowMS int64) error {
 	}
 
 	mihomo := s.currentMihomoSettings()
-	groups, err := s.listControllableProxyGroups(mihomo)
+	groups, err := s.listControllableProxyGroups(ctx, mihomo)
 	if err != nil {
 		return err
 	}
@@ -1696,7 +2026,7 @@ func (s *service) evaluateAutoRestore(nowMS int64) error {
 			continue
 		}
 
-		if err := s.switchProxyGroup(mihomo, group, session.OriginalProxy); err != nil {
+		if err := s.switchProxyGroup(ctx, mihomo, group, session.OriginalProxy); err != nil {
 			results = append(results, autoSwitchExecutionResult{
 				GroupName:   session.GroupName,
 				TargetProxy: session.OriginalProxy,
@@ -1747,8 +2077,8 @@ func (s *service) insertLogs(logs []trafficLog) error {
 	}
 
 	stmt, err := tx.Prepare(`
-		INSERT INTO traffic_logs (timestamp, source_ip, host, destination_ip, process, outbound, chains, upload, download)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO traffic_logs (timestamp, source_ip, host, destination_ip, process, outbound, chains, rule_group, upload, download)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		tx.Rollback()
@@ -1771,6 +2101,7 @@ func (s *service) insertLogs(logs []trafficLog) error {
 			entry.Process,
 			entry.Outbound,
 			string(chainsJSON),
+			entry.RuleGroup,
 			entry.Upload,
 			entry.Download,
 		); err != nil {
@@ -1795,6 +2126,15 @@ func (s *service) cleanupOldLogs(nowMS int64) error {
 	// 同时清理 device_mappings 中 last_seen 早于 retention 截止时间的记录
 	if _, err := s.db.Exec(`DELETE FROM device_mappings WHERE last_seen < ?`, aggCutoff); err != nil {
 		return err
+	}
+
+	summaryCutoff := nowMS - int64(s.aggregateRetentionDays)*4*86400000
+	if _, err := s.db.Exec(`DELETE FROM traffic_summary WHERE bucket_end < ?`, summaryCutoff); err != nil {
+		return err
+	}
+
+	if _, err := s.db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		log.Printf("WAL checkpoint failed: %v", err)
 	}
 
 	// 定期执行VACUUM（每周一次）
@@ -1828,8 +2168,6 @@ func normalizeHost(host string) string {
 	return parts[len(parts)-2] + "." + parts[len(parts)-1]
 }
 
-
-
 func (s *service) addToAggregateBuffer(logs []trafficLog, nowMS int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1858,6 +2196,7 @@ func (s *service) addToAggregateBuffer(logs []trafficLog, nowMS int64) error {
 				Process:       log.Process,
 				Outbound:      log.Outbound,
 				Chains:        string(chainsJSON),
+				RuleGroup:     log.RuleGroup,
 				Upload:        log.Upload,
 				Download:      log.Download,
 				Count:         1,
@@ -1894,8 +2233,8 @@ func (s *service) flushAggregateEntries(shouldFlush func(*aggregatedEntry) bool)
 
 	stmt, err := tx.Prepare(`
 		INSERT INTO traffic_aggregated
-		(bucket_start, bucket_end, source_ip, host, destination_ip, process, outbound, chains, upload, download, count)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		(bucket_start, bucket_end, source_ip, host, destination_ip, process, outbound, chains, rule_group, upload, download, count)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(bucket_start, bucket_end, source_ip, host, destination_ip, process, outbound, chains)
 		DO UPDATE SET
 			upload = traffic_aggregated.upload + excluded.upload,
@@ -1911,7 +2250,7 @@ func (s *service) flushAggregateEntries(shouldFlush func(*aggregatedEntry) bool)
 	for _, entry := range buffer {
 		if _, err := stmt.Exec(
 			entry.BucketStart, entry.BucketEnd, entry.SourceIP, entry.Host, entry.DestinationIP,
-			entry.Process, entry.Outbound, entry.Chains, entry.Upload, entry.Download, entry.Count,
+			entry.Process, entry.Outbound, entry.Chains, entry.RuleGroup, entry.Upload, entry.Download, entry.Count,
 		); err != nil {
 			tx.Rollback()
 			return err
@@ -1955,6 +2294,7 @@ func (s *service) routes() http.Handler {
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/api/settings/mihomo", s.handleMihomoSettings)
 	mux.HandleFunc("/api/settings/domain-grouping", s.handleDomainGroupingSettings)
+	mux.HandleFunc("/api/settings/direct-traffic-filter", s.handleDirectTrafficFilterSettings)
 	mux.HandleFunc("/api/settings/retention", s.handleRetentionSettings)
 	mux.HandleFunc("/api/auto-switch/settings", s.handleAutoSwitchSettings)
 	mux.HandleFunc("/api/auto-switch/groups", s.handleAutoSwitchGroups)
@@ -2058,6 +2398,29 @@ func (s *service) handleDomainGroupingSettings(w http.ResponseWriter, r *http.Re
 	}
 }
 
+func (s *service) handleDirectTrafficFilterSettings(w http.ResponseWriter, r *http.Request) {
+	type directTrafficFilterResponse struct {
+		Enabled bool `json:"enabled"`
+	}
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, directTrafficFilterResponse{Enabled: s.currentFilterDirectTraffic()})
+	case http.MethodPut:
+		var payload directTrafficFilterResponse
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			writeError(w, http.StatusBadRequest, errors.New("invalid json body"))
+			return
+		}
+		if err := s.updateFilterDirectTraffic(payload.Enabled); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, directTrafficFilterResponse{Enabled: s.currentFilterDirectTraffic()})
+	default:
+		writeMethodNotAllowed(w)
+	}
+}
+
 func (s *service) handleRetentionSettings(w http.ResponseWriter, r *http.Request) {
 	type retentionResponse struct {
 		Days int `json:"days"`
@@ -2142,7 +2505,7 @@ func (s *service) handleAutoSwitchGroups(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	groups, err := s.listControllableProxyGroups(s.currentMihomoSettings())
+	groups, err := s.listControllableProxyGroups(r.Context(), s.currentMihomoSettings())
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -2178,7 +2541,12 @@ func (s *service) handleAggregate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	raw := r.URL.Query().Get("raw") == "1"
-	data, err := s.queryAggregate(dimension, start, end, raw)
+	var data []aggregatedData
+	if r.URL.Query().Get("summary") == "1" {
+		data, err = s.querySummaryAggregate(dimension, start, end, raw)
+	} else {
+		data, err = s.queryAggregate(dimension, start, end, raw)
+	}
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -2224,7 +2592,12 @@ func (s *service) handleSubstats(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	data, err := s.querySubstats(dimension, label, start, end)
+	var data []aggregatedData
+	if r.URL.Query().Get("summary") == "1" {
+		data, err = s.querySummarySecondary(dimension, label, start, end)
+	} else {
+		data, err = s.querySubstats(dimension, label, start, end)
+	}
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -2251,7 +2624,12 @@ func (s *service) handleProxyStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	data, err := s.queryProxyStats(dimension, parentLabel, host, start, end)
+	var data []aggregatedData
+	if r.URL.Query().Get("summary") == "1" {
+		data, err = s.querySummaryProxyStats(dimension, parentLabel, host, start, end)
+	} else {
+		data, err = s.queryProxyStats(dimension, parentLabel, host, start, end)
+	}
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -2277,7 +2655,12 @@ func (s *service) handleDevicesByHost(w http.ResponseWriter, r *http.Request) {
 	}
 
 	hostFilter, hostArgs := s.hostFilterArgs(host)
-	data, err := s.queryByFilters("source_ip", hostFilter, hostArgs, start, end)
+	var data []aggregatedData
+	if r.URL.Query().Get("summary") == "1" {
+		data, err = s.querySummarySecondary("host", host, start, end)
+	} else {
+		data, err = s.queryByFilters("source_ip", hostFilter, hostArgs, start, end)
+	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -2338,7 +2721,12 @@ func (s *service) handleTrend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	data, err := s.queryTrend(start, end, bucket)
+	var data []trendPoint
+	if r.URL.Query().Get("summary") == "1" {
+		data, err = s.queryTrendSummary(start, end, bucket)
+	} else {
+		data, err = s.queryTrend(start, end, bucket)
+	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -2379,6 +2767,11 @@ func (s *service) handleConnectionDetails(w http.ResponseWriter, r *http.Request
 		}
 	}
 
+	if r.URL.Query().Get("summary") == "1" {
+		writeJSON(w, http.StatusOK, []connectionDetail{})
+		return
+	}
+
 	data, err := s.queryConnectionDetails(dimension, primary, secondary, start, end)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
@@ -2409,6 +2802,11 @@ func (s *service) handleLogs(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	if _, err := tx.Exec(`DELETE FROM traffic_summary`); err != nil {
+		tx.Rollback()
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
 	if err := tx.Commit(); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -2433,7 +2831,23 @@ func (s *service) queryAggregate(dimension string, start, end int64, raw bool) (
 	if column == "host" && !raw && s.currentDomainGroupingEnabled() {
 		rows = groupHostRows(rows)
 	}
+	if column == "rule_group" {
+		rows = hideUnknownRuleGroup(rows)
+	}
 	return rows, nil
+}
+
+// hideUnknownRuleGroup drops rows whose matched rule was never recorded
+// (legacy data and connections without rule info) from the 规则 view. A real
+// catch-all MATCH rule is labelled "match" and is still shown.
+func hideUnknownRuleGroup(rows []aggregatedData) []aggregatedData {
+	out := make([]aggregatedData, 0, len(rows))
+	for _, row := range rows {
+		if row.Label != unknownRuleGroup {
+			out = append(out, row)
+		}
+	}
+	return out
 }
 
 func groupHostRows(rows []aggregatedData) []aggregatedData {
@@ -2504,6 +2918,244 @@ func (s *service) queryByFilters(groupColumn, extraFilter string, extraArgs []an
 	return sortedAggregatedDataRows(merged), nil
 }
 
+func (s *service) querySummaryAggregate(dimension string, start, end int64, raw bool) ([]aggregatedData, error) {
+	column, err := dimensionColumn(dimension)
+	if err != nil {
+		return nil, err
+	}
+
+	data, err := s.querySummaryByDimension(dimension, start, end)
+	if err != nil {
+		return nil, err
+	}
+	if column == "host" && !raw && s.currentDomainGroupingEnabled() {
+		data = groupHostRows(data)
+	}
+	if column == "rule_group" {
+		data = hideUnknownRuleGroup(data)
+	}
+	return data, nil
+}
+
+func (s *service) querySummaryByDimension(dimension string, start, end int64) ([]aggregatedData, error) {
+	summaryDimension, labelColumn, err := summaryDimensionParts(dimension)
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err := s.querySummaryRows(summaryDimension, labelColumn, "", nil, start, end)
+	if err != nil {
+		return nil, err
+	}
+	merged := make(map[string]*aggregatedData)
+	mergeAggregatedDataRows(merged, rows)
+
+	column, err := dimensionColumn(dimension)
+	if err != nil {
+		return nil, err
+	}
+	detailStart, err := s.summaryCoveredEnd()
+	if err != nil {
+		return nil, err
+	}
+	fallbackStart := detailStart
+	if fallbackStart < start {
+		fallbackStart = start
+	}
+	detailItems, err := s.queryByFiltersFromAggregates(column, "", nil, fallbackStart, end)
+	if err != nil {
+		return nil, err
+	}
+	mergeAggregatedDataRows(merged, detailItems)
+	mergeAggregatedDataRows(merged, s.queryByFiltersFromBuffer(column, "", nil, start, end))
+	return sortedAggregatedDataRows(merged), nil
+}
+
+func (s *service) querySummaryRows(dimension, labelColumn, filter string, args []any, start, end int64) ([]aggregatedData, error) {
+	query := `
+		SELECT ` + labelColumn + ` AS label,
+		       COALESCE(SUM(upload), 0) AS upload,
+		       COALESCE(SUM(download), 0) AS download,
+		       COALESCE(SUM(upload + download), 0) AS total,
+		       COALESCE(SUM(count), 0) AS count
+		FROM traffic_summary
+		WHERE dimension = ? AND bucket_end > ? AND bucket_start <= ?` + filter + `
+		GROUP BY ` + labelColumn + `
+		ORDER BY total DESC, label ASC
+	`
+
+	rows, err := s.db.Query(query, append([]any{dimension, start, end}, args...)...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	results := make([]aggregatedData, 0)
+	for rows.Next() {
+		var item aggregatedData
+		if err := rows.Scan(&item.Label, &item.Upload, &item.Download, &item.Total, &item.Count); err != nil {
+			return nil, err
+		}
+		results = append(results, item)
+	}
+	return results, rows.Err()
+}
+
+func (s *service) querySummarySecondary(dimension, primary string, start, end int64) ([]aggregatedData, error) {
+	var summaryDimension, labelColumn, filter string
+	var args []any
+	var bufferGroupColumn, bufferFilter string
+
+	switch dimension {
+	case "sourceIP":
+		summaryDimension = "source_ip"
+		labelColumn = "secondary_label"
+		filter = " AND label = ?"
+		args = []any{primary}
+		bufferGroupColumn = "host"
+		bufferFilter = "source_ip = ?"
+	case "host":
+		summaryDimension = "source_ip"
+		labelColumn = "label"
+		hostFilter, hostArgs := s.hostFilterArgs(primary)
+		filter = " AND (secondary_label = ? OR secondary_label LIKE ?)"
+		if !s.currentDomainGroupingEnabled() {
+			filter = " AND secondary_label = ?"
+		}
+		args = hostArgs
+		bufferGroupColumn = "source_ip"
+		bufferFilter = hostFilter
+	case "outbound":
+		summaryDimension = "outbound"
+		labelColumn = "secondary_label"
+		filter = " AND label = ?"
+		args = []any{primary}
+		bufferGroupColumn = "host"
+		bufferFilter = "outbound = ?"
+	case "rule":
+		summaryDimension = "rule"
+		labelColumn = "secondary_label"
+		filter = " AND label = ?"
+		args = []any{primary}
+		bufferGroupColumn = "host"
+		bufferFilter = "rule_group = ?"
+	default:
+		return nil, fmt.Errorf("unsupported dimension %q", dimension)
+	}
+
+	detailStart, err := s.summaryCoveredEnd()
+	if err != nil {
+		return nil, err
+	}
+	fallbackStart := detailStart
+	if fallbackStart < start {
+		fallbackStart = start
+	}
+	rows, err := s.querySummaryRows(summaryDimension, labelColumn, filter, args, start, end)
+	if err != nil {
+		return nil, err
+	}
+	merged := make(map[string]*aggregatedData)
+	mergeAggregatedDataRows(merged, rows)
+	detailRows, err := s.queryByFiltersFromAggregates(bufferGroupColumn, bufferFilter, args, fallbackStart, end)
+	if err != nil {
+		return nil, err
+	}
+	mergeAggregatedDataRows(merged, detailRows)
+	mergeAggregatedDataRows(merged, s.queryByFiltersFromBuffer(bufferGroupColumn, bufferFilter, args, start, end))
+	return sortedAggregatedDataRows(merged), nil
+}
+
+func summaryDimensionParts(dimension string) (string, string, error) {
+	switch dimension {
+	case "sourceIP":
+		return "source_ip", "label", nil
+	case "host":
+		return "source_ip", "secondary_label", nil
+	case "outbound":
+		return "outbound", "label", nil
+	case "rule":
+		return "rule", "label", nil
+	default:
+		return "", "", fmt.Errorf("unsupported dimension %q", dimension)
+	}
+}
+
+func (s *service) summaryCoveredEnd() (int64, error) {
+	var lastBucketEnd sql.NullInt64
+	if err := s.db.QueryRow(`SELECT MAX(bucket_end) FROM traffic_summary`).Scan(&lastBucketEnd); err != nil {
+		return 0, err
+	}
+	if !lastBucketEnd.Valid {
+		return 0, nil
+	}
+	return lastBucketEnd.Int64, nil
+}
+
+func (s *service) querySummaryProxyStats(dimension, parentLabel, host string, start, end int64) ([]aggregatedData, error) {
+	switch dimension {
+	case "sourceIP":
+		return s.querySummaryRows("source_ip", "label", " AND label = ? AND secondary_label = ?", []any{parentLabel, host}, start, end)
+	case "outbound":
+		return s.querySummaryRows("outbound", "label", " AND label = ? AND secondary_label = ?", []any{parentLabel, host}, start, end)
+	default:
+		return nil, fmt.Errorf("unsupported dimension %q", dimension)
+	}
+}
+
+func (s *service) queryTrendSummary(start, end, bucket int64) ([]trendPoint, error) {
+	detailStart, err := s.summaryCoveredEnd()
+	if err != nil {
+		return nil, err
+	}
+	fallbackStart := detailStart
+	if fallbackStart < start {
+		fallbackStart = start
+	}
+	rows, err := s.db.Query(`
+		SELECT ((bucket_start / ?) * ?) AS bucket_start,
+		       COALESCE(SUM(upload), 0) AS upload,
+		       COALESCE(SUM(download), 0) AS download
+		FROM traffic_summary
+		WHERE dimension = 'total' AND bucket_end > ? AND bucket_start <= ?
+		GROUP BY bucket_start
+		ORDER BY bucket_start ASC
+	`, bucket, bucket, start, end)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	buckets := make(map[int64]trendPoint)
+	for rows.Next() {
+		var point trendPoint
+		if err := rows.Scan(&point.Timestamp, &point.Upload, &point.Download); err != nil {
+			return nil, err
+		}
+		mergeTrendPoints(buckets, []trendPoint{point})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	detailTrend, err := s.queryTrendFromAggregates(fallbackStart, end, bucket)
+	if err != nil {
+		return nil, err
+	}
+	mergeTrendPoints(buckets, detailTrend)
+	mergeTrendPoints(buckets, s.queryTrendFromBuffer(start, end, bucket))
+
+	points := make([]trendPoint, 0, (end-start)/bucket+1)
+	for t := start; t <= end; t += bucket {
+		key := (t / bucket) * bucket
+		if point, ok := buckets[key]; ok {
+			points = append(points, point)
+			continue
+		}
+		points = append(points, trendPoint{Timestamp: key})
+	}
+	return points, nil
+}
 
 func (s *service) queryConnectionDetails(dimension, primary, secondary string, start, end int64) ([]connectionDetail, error) {
 	filter, args, err := detailFilter(dimension, primary, secondary)
@@ -2650,13 +3302,22 @@ func (s *service) queryByFiltersFromBuffer(groupColumn, extraFilter string, extr
 }
 
 func (s *service) queryByFiltersFromTable(table, timeFilter string, timeArgs []any, groupColumn, extraFilter string, extraArgs []any, countExpr string) ([]aggregatedData, error) {
+	fromClause := table
+	// Unfiltered GROUP BY over traffic_aggregated: without a hint the planner
+	// picks a covering scan of the single-column dimension index, which touches
+	// every row and makes query time proportional to the whole table. Forcing the
+	// bucket index bounds the scan to the requested time range (e.g. ~35x faster
+	// for a 7-day view on a 1M+ row table).
+	if table == "traffic_aggregated" && extraFilter == "" {
+		fromClause += " INDEXED BY idx_traffic_aggregated_bucket"
+	}
 	base := `
 		SELECT ` + groupColumn + ` AS label,
 		       COALESCE(SUM(upload), 0) AS upload,
 		       COALESCE(SUM(download), 0) AS download,
 		       COALESCE(SUM(upload + download), 0) AS total,
 		       ` + countExpr + ` AS count
-		FROM ` + table + `
+		FROM ` + fromClause + `
 		WHERE ` + timeFilter
 
 	args := append([]any{}, timeArgs...)
@@ -2891,6 +3552,8 @@ func aggregateEntryFieldValue(entry aggregatedEntry, column string) string {
 		return entry.Outbound
 	case "chains":
 		return entry.Chains
+	case "rule_group":
+		return entry.RuleGroup
 	default:
 		return ""
 	}
@@ -3032,6 +3695,8 @@ func dimensionColumn(dimension string) (string, error) {
 		return "process", nil
 	case "outbound":
 		return "outbound", nil
+	case "rule":
+		return "rule_group", nil
 	default:
 		return "", fmt.Errorf("unsupported dimension %q", dimension)
 	}
@@ -3047,21 +3712,58 @@ func detailFilter(dimension, primary, secondary string) (string, []any, error) {
 		return "outbound = ? AND host = ?", []any{primary, secondary}, nil
 	case "process":
 		return "process = ? AND host = ?", []any{primary, secondary}, nil
+	case "rule":
+		return "rule_group = ? AND host = ?", []any{primary, secondary}, nil
 	default:
 		return "", nil, fmt.Errorf("unsupported dimension %q", dimension)
 	}
 }
 
+// unknownRuleGroup marks traffic whose matched rule was not recorded (legacy
+// rows and connections without rule info). It is hidden from the 规则 view,
+// unlike a real catch-all MATCH rule which is labelled "match" and shown.
+const unknownRuleGroup = "unknown"
+
+// ruleGroupLabel derives a display group from the Clash rule that matched a
+// connection. Rule type and payload come straight from Mihomo's /connections
+// (e.g. rule="GeoSite", rulePayload="telegram"), so a bare IP like
+// 91.108.56.108 can be surfaced as "geosite:telegram" instead of an opaque IP.
+func ruleGroupLabel(rule, rulePayload string) string {
+	rule = strings.ToLower(strings.TrimSpace(rule))
+	rulePayload = strings.TrimSpace(rulePayload)
+	if rule == "" {
+		return unknownRuleGroup
+	}
+	if rulePayload == "" {
+		return rule
+	}
+	return rule + ":" + rulePayload
+}
+
 func outboundName(chains []string) string {
 	if len(chains) == 0 || chains[0] == "" {
-		return "DIRECT"
+		return directOutboundName
 	}
 	return chains[0]
 }
 
+// directOutboundName is the outbound Clash/Mihomo reports for connections that
+// bypass every proxy node. A chain that contains it never reached a proxy, so
+// the connection counts as direct traffic.
+const directOutboundName = "DIRECT"
+
+func isDirectConnection(chains []string) bool {
+	for _, hop := range sanitizeChains(chains) {
+		if strings.EqualFold(strings.TrimSpace(hop), directOutboundName) {
+			return true
+		}
+	}
+	return false
+}
+
 func sanitizeChains(chains []string) []string {
 	if len(chains) == 0 {
-		return []string{"DIRECT"}
+		return []string{directOutboundName}
 	}
 
 	cleaned := make([]string, 0, len(chains))
@@ -3072,7 +3774,7 @@ func sanitizeChains(chains []string) []string {
 		}
 	}
 	if len(cleaned) == 0 {
-		return []string{"DIRECT"}
+		return []string{directOutboundName}
 	}
 	return cleaned
 }

@@ -5,12 +5,15 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -493,7 +496,7 @@ func TestListControllableProxyGroupsFiltersToSelectAndFallback(t *testing.T) {
 		}),
 	}
 
-	got, err := svc.listControllableProxyGroups(mihomoSettings{
+	got, err := svc.listControllableProxyGroups(context.Background(), mihomoSettings{
 		URL:    "http://127.0.0.1:9090",
 		Secret: "test-secret",
 	})
@@ -521,7 +524,7 @@ func TestListControllableProxyGroupsFiltersToSelectAndFallback(t *testing.T) {
 func TestSwitchProxyGroupRejectsTargetOutsideCandidates(t *testing.T) {
 	svc := newTestService(t)
 
-	err := svc.switchProxyGroup(mihomoSettings{URL: "http://127.0.0.1:9090"}, controllableProxyGroup{
+	err := svc.switchProxyGroup(context.Background(), mihomoSettings{URL: "http://127.0.0.1:9090"}, controllableProxyGroup{
 		Name: "🌍 国外媒体",
 		Type: "select",
 		Now:  "🚩 PROXY",
@@ -565,7 +568,7 @@ func TestSwitchProxyGroupSendsSelectionRequest(t *testing.T) {
 		}),
 	}
 
-	err := svc.switchProxyGroup(mihomoSettings{
+	err := svc.switchProxyGroup(context.Background(), mihomoSettings{
 		URL:    "http://127.0.0.1:9090",
 		Secret: "test-secret",
 	}, controllableProxyGroup{
@@ -642,6 +645,212 @@ func TestCleanupOldLogsKeepsThirtyDaysOfAggregates(t *testing.T) {
 	}
 }
 
+func TestBackfillSummaryBuildsDailySummaryRows(t *testing.T) {
+	svc := newTestService(t)
+
+	day := int64(24 * time.Hour / time.Millisecond)
+	now := time.Date(2026, 8, 6, 15, 0, 0, 0, time.Local).UnixMilli()
+	dayStart := (now / day) * day
+	insertTestAggregates(t, svc.db, []aggregatedEntry{
+		{
+			BucketStart: dayStart - 2*day,
+			BucketEnd:   dayStart - 2*day + 60000,
+			SourceIP:    "192.168.1.8",
+			Host:        "old.example.com",
+			Outbound:    "DIRECT",
+			Chains:      `["DIRECT"]`,
+			Upload:      10,
+			Download:    20,
+			Count:       1,
+		},
+		{
+			BucketStart: dayStart - day,
+			BucketEnd:   dayStart - day + 60000,
+			SourceIP:    "192.168.1.8",
+			Host:        "new.example.com",
+			Outbound:    "ProxyA",
+			Chains:      `["ProxyA"]`,
+			Upload:      30,
+			Download:    40,
+			Count:       2,
+		},
+	})
+
+	if err := backfillSummary(svc.db, now); err != nil {
+		t.Fatalf("backfillSummary: %v", err)
+	}
+
+	var rowCount int
+	if err := svc.db.QueryRow(`SELECT COUNT(*) FROM traffic_summary`).Scan(&rowCount); err != nil {
+		t.Fatalf("count traffic_summary: %v", err)
+	}
+	if rowCount != 8 {
+		t.Fatalf("expected 2 days x source/outbound/rule/total summary rows, got %d", rowCount)
+	}
+}
+
+func TestQuerySummaryAggregateSecondaryAndTrend(t *testing.T) {
+	svc := newTestService(t)
+
+	day := int64(24 * time.Hour / time.Millisecond)
+	now := time.Date(2026, 8, 6, 15, 0, 0, 0, time.Local).UnixMilli()
+	dayStart := (now / day) * day
+	insertTestAggregates(t, svc.db, []aggregatedEntry{
+		{
+			BucketStart:   dayStart - day,
+			BucketEnd:     dayStart - day + 60000,
+			SourceIP:      "192.168.1.8",
+			Host:          "api.example.com",
+			DestinationIP: "1.1.1.1",
+			Process:       "curl",
+			Outbound:      "ProxyA",
+			Chains:        `["ProxyA"]`,
+			Upload:        15,
+			Download:      25,
+			Count:         1,
+		},
+	})
+	if err := backfillSummary(svc.db, now); err != nil {
+		t.Fatalf("backfillSummary: %v", err)
+	}
+
+	start := dayStart - day
+	end := dayStart - 1
+	sources, err := svc.querySummaryAggregate("sourceIP", start, end, false)
+	if err != nil {
+		t.Fatalf("querySummaryAggregate(sourceIP): %v", err)
+	}
+	if len(sources) != 1 || sources[0].Label != "192.168.1.8" || sources[0].Upload != 15 || sources[0].Download != 25 {
+		t.Fatalf("unexpected source summary: %+v", sources)
+	}
+
+	hosts, err := svc.querySummarySecondary("sourceIP", "192.168.1.8", start, end)
+	if err != nil {
+		t.Fatalf("querySummarySecondary(sourceIP): %v", err)
+	}
+	if len(hosts) != 1 || hosts[0].Label != "api.example.com" {
+		t.Fatalf("unexpected host secondary summary: %+v", hosts)
+	}
+
+	devices, err := svc.querySummarySecondary("host", "api.example.com", start, end)
+	if err != nil {
+		t.Fatalf("querySummarySecondary(host): %v", err)
+	}
+	if len(devices) != 1 || devices[0].Label != "192.168.1.8" {
+		t.Fatalf("unexpected device secondary summary: %+v", devices)
+	}
+
+	trend, err := svc.queryTrendSummary(start, end, day)
+	if err != nil {
+		t.Fatalf("queryTrendSummary: %v", err)
+	}
+	if len(trend) != 1 || trend[0].Upload != 15 || trend[0].Download != 25 {
+		t.Fatalf("unexpected trend summary: %+v", trend)
+	}
+}
+
+func TestQuerySummaryIncludesCurrentDayDetailFallback(t *testing.T) {
+	svc := newTestService(t)
+
+	day := int64(24 * time.Hour / time.Millisecond)
+	now := time.Date(2026, 8, 6, 15, 0, 0, 0, time.Local).UnixMilli()
+	dayStart := (now / day) * day
+	insertTestAggregates(t, svc.db, []aggregatedEntry{
+		{
+			BucketStart: dayStart - day,
+			BucketEnd:   dayStart - day + 60000,
+			SourceIP:    "192.168.1.8",
+			Host:        "old.example.com",
+			Outbound:    "ProxyA",
+			Chains:      `["ProxyA"]`,
+			Upload:      10,
+			Download:    20,
+			Count:       1,
+		},
+		{
+			BucketStart: dayStart,
+			BucketEnd:   dayStart + 60000,
+			SourceIP:    "192.168.1.8",
+			Host:        "today.example.com",
+			Outbound:    "ProxyB",
+			Chains:      `["ProxyB"]`,
+			Upload:      30,
+			Download:    40,
+			Count:       1,
+		},
+	})
+	if err := backfillSummary(svc.db, now); err != nil {
+		t.Fatalf("backfillSummary: %v", err)
+	}
+
+	rows, err := svc.querySummaryAggregate("sourceIP", dayStart-day, now, false)
+	if err != nil {
+		t.Fatalf("querySummaryAggregate: %v", err)
+	}
+	if len(rows) != 1 || rows[0].Label != "192.168.1.8" || rows[0].Upload != 40 || rows[0].Download != 60 {
+		t.Fatalf("expected summary plus current day fallback, got %+v", rows)
+	}
+
+	hosts, err := svc.querySummarySecondary("sourceIP", "192.168.1.8", dayStart-day, now)
+	if err != nil {
+		t.Fatalf("querySummarySecondary: %v", err)
+	}
+	if len(hosts) != 2 {
+		t.Fatalf("expected both summary and current day hosts, got %+v", hosts)
+	}
+
+	trend, err := svc.queryTrendSummary(dayStart-day, now, day)
+	if err != nil {
+		t.Fatalf("queryTrendSummary: %v", err)
+	}
+	if len(trend) != 2 || trend[1].Upload != 30 || trend[1].Download != 40 {
+		t.Fatalf("expected summary and current day trend, got %+v", trend)
+	}
+}
+
+func TestCleanupOldLogsKeepsSummaryForFourTimesRetention(t *testing.T) {
+	svc := newTestService(t)
+
+	now := time.Date(2026, 8, 6, 12, 0, 0, 0, time.Local).UnixMilli()
+	day := int64(24 * time.Hour / time.Millisecond)
+	insertSummaryRows := func(bucketStart int64, label string) {
+		t.Helper()
+		_, err := svc.db.Exec(`
+			INSERT INTO traffic_summary
+			(bucket_start, bucket_end, dimension, label, secondary_label, upload, download, count)
+			VALUES (?, ?, 'source_ip', ?, '', 1, 2, 3)
+		`, bucketStart, bucketStart+day, label)
+		if err != nil {
+			t.Fatalf("insert traffic_summary: %v", err)
+		}
+	}
+
+	cutoff := now - int64(svc.aggregateRetentionDays*4)*day
+	insertSummaryRows(cutoff-2*day, "old")
+	insertSummaryRows(cutoff+day, "keep")
+
+	if err := svc.cleanupOldLogs(now); err != nil {
+		t.Fatalf("cleanupOldLogs: %v", err)
+	}
+
+	var labels []string
+	rows, err := svc.db.Query(`SELECT label FROM traffic_summary ORDER BY label`)
+	if err != nil {
+		t.Fatalf("query traffic_summary: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var label string
+		if err := rows.Scan(&label); err != nil {
+			t.Fatalf("scan traffic_summary: %v", err)
+		}
+		labels = append(labels, label)
+	}
+	if len(labels) != 1 || labels[0] != "keep" {
+		t.Fatalf("expected only recent summary row, got %v", labels)
+	}
+}
+
 func TestProcessConnectionsBuffersAggregatesWithoutPersistingRawLogs(t *testing.T) {
 	svc := newTestService(t)
 
@@ -667,7 +876,7 @@ func TestProcessConnectionsBuffersAggregatesWithoutPersistingRawLogs(t *testing.
 		},
 	}
 
-	if err := svc.processConnections(payload); err != nil {
+	if err := svc.processConnections(context.Background(), payload); err != nil {
 		t.Fatalf("processConnections: %v", err)
 	}
 
@@ -691,6 +900,92 @@ func TestProcessConnectionsBuffersAggregatesWithoutPersistingRawLogs(t *testing.
 		}
 		if entry.Upload != 128 || entry.Download != 256 || entry.Count != 1 {
 			t.Fatalf("unexpected aggregate totals: %+v", entry)
+		}
+	}
+}
+
+func TestProcessConnectionsSkipsDirectTrafficWhenFilterEnabled(t *testing.T) {
+	svc := newTestService(t)
+	svc.filterDirectTraffic = true
+
+	payload := &connectionsResponse{
+		Connections: []connection{
+			testConnection("conn-direct", []string{"DIRECT"}, 9000, 9000),
+			testConnection("conn-proxy", []string{"ProxyA", "RelayB"}, 128, 256),
+		},
+	}
+
+	if err := svc.processConnections(context.Background(), payload); err != nil {
+		t.Fatalf("processConnections: %v", err)
+	}
+
+	if len(svc.aggregateBuffer) != 1 {
+		t.Fatalf("expected only the proxied connection to be buffered, got %d entries", len(svc.aggregateBuffer))
+	}
+	for _, entry := range svc.aggregateBuffer {
+		if entry.Outbound != "ProxyA" {
+			t.Fatalf("unexpected buffered outbound: %+v", entry)
+		}
+		if entry.Upload != 128 || entry.Download != 256 {
+			t.Fatalf("unexpected buffered totals: %+v", entry)
+		}
+	}
+}
+
+func TestFilterDirectTrafficSettingDefaultsOffAndSurvivesRestart(t *testing.T) {
+	svc := newTestService(t)
+
+	if svc.currentFilterDirectTraffic() {
+		t.Fatal("expected direct traffic filter to default to off")
+	}
+
+	if err := saveFilterDirectTraffic(svc.db, true); err != nil {
+		t.Fatalf("saveFilterDirectTraffic: %v", err)
+	}
+	if !loadFilterDirectTraffic(svc.db) {
+		t.Fatal("expected persisted filter flag to load as true")
+	}
+
+	restarted := newTestServiceOnDB(svc.db)
+	if !restarted.currentFilterDirectTraffic() {
+		t.Fatal("expected restarted service to pick up the persisted filter flag")
+	}
+}
+
+func TestDirectTrafficFilterKeepsBaselineSoReplayDoesNotSpike(t *testing.T) {
+	svc := newTestService(t)
+
+	if err := svc.updateFilterDirectTraffic(true); err != nil {
+		t.Fatalf("updateFilterDirectTraffic(true): %v", err)
+	}
+
+	first := &connectionsResponse{
+		Connections: []connection{testConnection("conn-1", []string{"DIRECT"}, 100, 100)},
+	}
+	if err := svc.processConnections(context.Background(), first); err != nil {
+		t.Fatalf("processConnections first: %v", err)
+	}
+	if len(svc.aggregateBuffer) != 0 {
+		t.Fatalf("expected direct traffic to be dropped, got %d buffer entries", len(svc.aggregateBuffer))
+	}
+
+	if err := svc.updateFilterDirectTraffic(false); err != nil {
+		t.Fatalf("updateFilterDirectTraffic(false): %v", err)
+	}
+
+	second := &connectionsResponse{
+		Connections: []connection{testConnection("conn-1", []string{"DIRECT"}, 500, 500)},
+	}
+	if err := svc.processConnections(context.Background(), second); err != nil {
+		t.Fatalf("processConnections second: %v", err)
+	}
+
+	if len(svc.aggregateBuffer) != 1 {
+		t.Fatalf("expected 1 buffer entry after re-enabling tracking, got %d", len(svc.aggregateBuffer))
+	}
+	for _, entry := range svc.aggregateBuffer {
+		if entry.Upload != 400 || entry.Download != 400 {
+			t.Fatalf("expected only the 400 byte delta to be recorded, got %+v", entry)
 		}
 	}
 }
@@ -781,13 +1076,13 @@ func TestProcessConnectionsAutoSwitchTriggersOncePerMinute(t *testing.T) {
 		}},
 	}
 
-	if err := svc.processConnections(first); err != nil {
+	if err := svc.processConnections(context.Background(), first); err != nil {
 		t.Fatalf("processConnections first: %v", err)
 	}
-	if err := svc.processConnections(second); err != nil {
+	if err := svc.processConnections(context.Background(), second); err != nil {
 		t.Fatalf("processConnections second: %v", err)
 	}
-	if err := svc.processConnections(third); err != nil {
+	if err := svc.processConnections(context.Background(), third); err != nil {
 		t.Fatalf("processConnections third: %v", err)
 	}
 
@@ -889,10 +1184,10 @@ func TestAutoSwitchOnlySwitchesTriggeredEnabledGroup(t *testing.T) {
 		}},
 	}
 
-	if err := svc.processConnections(first); err != nil {
+	if err := svc.processConnections(context.Background(), first); err != nil {
 		t.Fatalf("processConnections first: %v", err)
 	}
-	if err := svc.processConnections(second); err != nil {
+	if err := svc.processConnections(context.Background(), second); err != nil {
 		t.Fatalf("processConnections second: %v", err)
 	}
 
@@ -989,10 +1284,10 @@ func TestAutoSwitchMatchesEnabledGroupWithinChains(t *testing.T) {
 		}},
 	}
 
-	if err := svc.processConnections(first); err != nil {
+	if err := svc.processConnections(context.Background(), first); err != nil {
 		t.Fatalf("processConnections first: %v", err)
 	}
-	if err := svc.processConnections(second); err != nil {
+	if err := svc.processConnections(context.Background(), second); err != nil {
 		t.Fatalf("processConnections second: %v", err)
 	}
 
@@ -1088,10 +1383,10 @@ func TestAutoSwitchIgnoresTrafficForGroupsNotEnabledInSettings(t *testing.T) {
 		}},
 	}
 
-	if err := svc.processConnections(first); err != nil {
+	if err := svc.processConnections(context.Background(), first); err != nil {
 		t.Fatalf("processConnections first: %v", err)
 	}
-	if err := svc.processConnections(second); err != nil {
+	if err := svc.processConnections(context.Background(), second); err != nil {
 		t.Fatalf("processConnections second: %v", err)
 	}
 
@@ -1180,12 +1475,12 @@ func TestAutoSwitchCooldownSkipsNextMinuteTrigger(t *testing.T) {
 		}},
 	}
 
-	if err := svc.processConnections(firstMinute); err != nil {
+	if err := svc.processConnections(context.Background(), firstMinute); err != nil {
 		t.Fatalf("processConnections firstMinute: %v", err)
 	}
 
 	currentTime = currentTime.Add(time.Minute)
-	if err := svc.processConnections(secondMinute); err != nil {
+	if err := svc.processConnections(context.Background(), secondMinute); err != nil {
 		t.Fatalf("processConnections secondMinute: %v", err)
 	}
 
@@ -1277,10 +1572,10 @@ func TestAutoSwitchCreatesRestoreSession(t *testing.T) {
 			}},
 		}
 
-		if err := svc.processConnections(first); err != nil {
+		if err := svc.processConnections(context.Background(), first); err != nil {
 			t.Fatalf("processConnections first: %v", err)
 		}
-		if err := svc.processConnections(second); err != nil {
+		if err := svc.processConnections(context.Background(), second); err != nil {
 			t.Fatalf("processConnections second: %v", err)
 		}
 
@@ -1327,7 +1622,7 @@ func TestAutoSwitchCreatesRestoreSession(t *testing.T) {
 		svc.now = func() time.Time { return currentTime }
 
 		currentProxy := map[string]string{
-			"🌍 国外媒体":   "🚩 PROXY",
+			"🌍 国外媒体":  "🚩 PROXY",
 			"⏬ 大流量套餐": "🇯🇵 Japan",
 		}
 		switches := make([]string, 0, 2)
@@ -1388,10 +1683,10 @@ func TestAutoSwitchCreatesRestoreSession(t *testing.T) {
 			}},
 		}
 
-		if err := svc.processConnections(first); err != nil {
+		if err := svc.processConnections(context.Background(), first); err != nil {
 			t.Fatalf("processConnections first: %v", err)
 		}
-		if err := svc.processConnections(second); err != nil {
+		if err := svc.processConnections(context.Background(), second); err != nil {
 			t.Fatalf("processConnections second: %v", err)
 		}
 
@@ -1501,10 +1796,10 @@ func TestAutoSwitchCreatesRestoreSession(t *testing.T) {
 			}},
 		}
 
-		if err := svc.processConnections(first); err != nil {
+		if err := svc.processConnections(context.Background(), first); err != nil {
 			t.Fatalf("processConnections first: %v", err)
 		}
-		if err := svc.processConnections(second); err != nil {
+		if err := svc.processConnections(context.Background(), second); err != nil {
 			t.Fatalf("processConnections second: %v", err)
 		}
 
@@ -1544,7 +1839,7 @@ func TestAutoSwitchCreatesRestoreSession(t *testing.T) {
 
 		switches := make([]string, 0, 2)
 		currentProxy := map[string]string{
-			"🌍 国外媒体":   "🚩 PROXY",
+			"🌍 国外媒体":  "🚩 PROXY",
 			"⏬ 大流量套餐": "🇯🇵 Japan",
 		}
 		svc.client = &http.Client{
@@ -1604,10 +1899,10 @@ func TestAutoSwitchCreatesRestoreSession(t *testing.T) {
 			}},
 		}
 
-		if err := svc.processConnections(first); err != nil {
+		if err := svc.processConnections(context.Background(), first); err != nil {
 			t.Fatalf("processConnections first: %v", err)
 		}
-		if err := svc.processConnections(second); err != nil {
+		if err := svc.processConnections(context.Background(), second); err != nil {
 			t.Fatalf("processConnections second: %v", err)
 		}
 
@@ -1711,10 +2006,10 @@ func TestAutoSwitchCreatesRestoreSession(t *testing.T) {
 					}},
 				}
 
-				if err := svc.processConnections(first); err != nil {
+				if err := svc.processConnections(context.Background(), first); err != nil {
 					t.Fatalf("processConnections first: %v", err)
 				}
-				if err := svc.processConnections(second); err != nil && tc.name != "failed" {
+				if err := svc.processConnections(context.Background(), second); err != nil && tc.name != "failed" {
 					t.Fatalf("processConnections second: %v", err)
 				}
 
@@ -1817,15 +2112,15 @@ func TestAutoSwitchCreatesRestoreSession(t *testing.T) {
 			}},
 		}
 
-		if err := svc.processConnections(firstMinute); err != nil {
+		if err := svc.processConnections(context.Background(), firstMinute); err != nil {
 			t.Fatalf("processConnections firstMinute: %v", err)
 		}
-		if err := svc.processConnections(firstMinuteTrigger); err != nil {
+		if err := svc.processConnections(context.Background(), firstMinuteTrigger); err != nil {
 			t.Fatalf("processConnections firstMinuteTrigger: %v", err)
 		}
 
 		currentTime = currentTime.Add(time.Minute)
-		if err := svc.processConnections(secondMinuteTrigger); err != nil {
+		if err := svc.processConnections(context.Background(), secondMinuteTrigger); err != nil {
 			t.Fatalf("processConnections secondMinuteTrigger: %v", err)
 		}
 
@@ -1854,32 +2149,32 @@ func TestAutoSwitchCreatesRestoreSession(t *testing.T) {
 func TestAutoRestore(t *testing.T) {
 	newTriggerResponses := func(host string) (*connectionsResponse, *connectionsResponse) {
 		return &connectionsResponse{
-				Connections: []connection{{
-					ID:       "conn-1",
-					Upload:   100,
-					Download: 100,
-					Chains:   []string{"🌍 国外媒体"},
-					Metadata: struct {
-						SourceIP      string "json:\"sourceIP\""
-						Host          string "json:\"host\""
-						DestinationIP string "json:\"destinationIP\""
-						Process       string "json:\"process\""
-					}{SourceIP: "192.168.1.2", Host: host, DestinationIP: "1.1.1.1", Process: "chrome"},
-				}},
-			}, &connectionsResponse{
-				Connections: []connection{{
-					ID:       "conn-1",
-					Upload:   250,
-					Download: 150,
-					Chains:   []string{"🌍 国外媒体"},
-					Metadata: struct {
-						SourceIP      string "json:\"sourceIP\""
-						Host          string "json:\"host\""
-						DestinationIP string "json:\"destinationIP\""
-						Process       string "json:\"process\""
-					}{SourceIP: "192.168.1.2", Host: host, DestinationIP: "1.1.1.1", Process: "chrome"},
-				}},
-			}
+			Connections: []connection{{
+				ID:       "conn-1",
+				Upload:   100,
+				Download: 100,
+				Chains:   []string{"🌍 国外媒体"},
+				Metadata: struct {
+					SourceIP      string "json:\"sourceIP\""
+					Host          string "json:\"host\""
+					DestinationIP string "json:\"destinationIP\""
+					Process       string "json:\"process\""
+				}{SourceIP: "192.168.1.2", Host: host, DestinationIP: "1.1.1.1", Process: "chrome"},
+			}},
+		}, &connectionsResponse{
+			Connections: []connection{{
+				ID:       "conn-1",
+				Upload:   250,
+				Download: 150,
+				Chains:   []string{"🌍 国外媒体"},
+				Metadata: struct {
+					SourceIP      string "json:\"sourceIP\""
+					Host          string "json:\"host\""
+					DestinationIP string "json:\"destinationIP\""
+					Process       string "json:\"process\""
+				}{SourceIP: "192.168.1.2", Host: host, DestinationIP: "1.1.1.1", Process: "chrome"},
+			}},
+		}
 	}
 
 	t.Run("restore happens after quiet minutes with no new trigger", func(t *testing.T) {
@@ -1938,15 +2233,15 @@ func TestAutoRestore(t *testing.T) {
 		}
 
 		first, trigger := newTriggerResponses("video.example")
-		if err := svc.processConnections(first); err != nil {
+		if err := svc.processConnections(context.Background(), first); err != nil {
 			t.Fatalf("processConnections first: %v", err)
 		}
-		if err := svc.processConnections(trigger); err != nil {
+		if err := svc.processConnections(context.Background(), trigger); err != nil {
 			t.Fatalf("processConnections trigger: %v", err)
 		}
 
 		currentTime = currentTime.Add(2 * time.Minute)
-		if err := svc.processConnections(&connectionsResponse{}); err != nil {
+		if err := svc.processConnections(context.Background(), &connectionsResponse{}); err != nil {
 			t.Fatalf("processConnections restore tick: %v", err)
 		}
 
@@ -2026,10 +2321,10 @@ func TestAutoRestore(t *testing.T) {
 		}
 
 		first, trigger := newTriggerResponses("video.example")
-		if err := svc.processConnections(first); err != nil {
+		if err := svc.processConnections(context.Background(), first); err != nil {
 			t.Fatalf("processConnections first: %v", err)
 		}
-		if err := svc.processConnections(trigger); err != nil {
+		if err := svc.processConnections(context.Background(), trigger); err != nil {
 			t.Fatalf("processConnections trigger: %v", err)
 		}
 
@@ -2048,12 +2343,12 @@ func TestAutoRestore(t *testing.T) {
 				}{SourceIP: "192.168.1.3", Host: "download.example", DestinationIP: "8.8.8.8", Process: "wget"},
 			}},
 		}
-		if err := svc.processConnections(nextMinute); err != nil {
+		if err := svc.processConnections(context.Background(), nextMinute); err != nil {
 			t.Fatalf("processConnections nextMinute: %v", err)
 		}
 
 		currentTime = currentTime.Add(time.Minute)
-		if err := svc.processConnections(&connectionsResponse{}); err != nil {
+		if err := svc.processConnections(context.Background(), &connectionsResponse{}); err != nil {
 			t.Fatalf("processConnections quiet tick: %v", err)
 		}
 
@@ -2123,16 +2418,16 @@ func TestAutoRestore(t *testing.T) {
 		}
 
 		first, trigger := newTriggerResponses("video.example")
-		if err := svc.processConnections(first); err != nil {
+		if err := svc.processConnections(context.Background(), first); err != nil {
 			t.Fatalf("processConnections first: %v", err)
 		}
-		if err := svc.processConnections(trigger); err != nil {
+		if err := svc.processConnections(context.Background(), trigger); err != nil {
 			t.Fatalf("processConnections trigger: %v", err)
 		}
 
 		currentProxy = "🇯🇵 Japan"
 		currentTime = currentTime.Add(2 * time.Minute)
-		if err := svc.processConnections(&connectionsResponse{}); err != nil {
+		if err := svc.processConnections(context.Background(), &connectionsResponse{}); err != nil {
 			t.Fatalf("processConnections restore tick: %v", err)
 		}
 
@@ -2211,16 +2506,16 @@ func TestAutoRestore(t *testing.T) {
 		}
 
 		first, trigger := newTriggerResponses("video.example")
-		if err := svc.processConnections(first); err != nil {
+		if err := svc.processConnections(context.Background(), first); err != nil {
 			t.Fatalf("processConnections first: %v", err)
 		}
-		if err := svc.processConnections(trigger); err != nil {
+		if err := svc.processConnections(context.Background(), trigger); err != nil {
 			t.Fatalf("processConnections trigger: %v", err)
 		}
 
 		allList = []string{"🇸🇬 Singapore", "🇯🇵 Japan"}
 		currentTime = currentTime.Add(2 * time.Minute)
-		if err := svc.processConnections(&connectionsResponse{}); err != nil {
+		if err := svc.processConnections(context.Background(), &connectionsResponse{}); err != nil {
 			t.Fatalf("processConnections restore tick: %v", err)
 		}
 
@@ -2610,6 +2905,86 @@ func TestQueryAggregateIncludesBufferedData(t *testing.T) {
 	}
 }
 
+func TestSummaryAPIEndpointsUseSummaryTable(t *testing.T) {
+	svc := newTestService(t)
+
+	day := int64(24 * time.Hour / time.Millisecond)
+	now := time.Date(2026, 8, 6, 15, 0, 0, 0, time.Local).UnixMilli()
+	dayStart := (now / day) * day
+	insertTestAggregates(t, svc.db, []aggregatedEntry{
+		{
+			BucketStart: dayStart - day,
+			BucketEnd:   dayStart - day + 60000,
+			SourceIP:    "192.168.1.8",
+			Host:        "api.example.com",
+			Outbound:    "ProxyA",
+			Chains:      `["ProxyA"]`,
+			Upload:      15,
+			Download:    25,
+			Count:       1,
+		},
+	})
+	if err := backfillSummary(svc.db, now); err != nil {
+		t.Fatalf("backfillSummary: %v", err)
+	}
+
+	start := dayStart - day
+	end := dayStart - 1
+	req := httptest.NewRequest(
+		http.MethodGet,
+		"/api/traffic/aggregate?dimension=sourceIP&start="+strconv.FormatInt(start, 10)+"&end="+strconv.FormatInt(end, 10)+"&summary=1",
+		nil,
+	)
+	rec := httptest.NewRecorder()
+	svc.routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("aggregate summary status: %d body=%s", rec.Code, rec.Body.String())
+	}
+	var rows []aggregatedData
+	if err := json.Unmarshal(rec.Body.Bytes(), &rows); err != nil {
+		t.Fatalf("decode aggregate summary: %v", err)
+	}
+	if len(rows) != 1 || rows[0].Label != "192.168.1.8" || rows[0].Upload != 15 {
+		t.Fatalf("unexpected aggregate summary response: %+v", rows)
+	}
+
+	req = httptest.NewRequest(
+		http.MethodGet,
+		"/api/traffic/trend?start="+strconv.FormatInt(start, 10)+"&end="+strconv.FormatInt(end, 10)+"&bucket="+strconv.FormatInt(day, 10)+"&summary=1",
+		nil,
+	)
+	rec = httptest.NewRecorder()
+	svc.routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("trend summary status: %d body=%s", rec.Code, rec.Body.String())
+	}
+	var points []trendPoint
+	if err := json.Unmarshal(rec.Body.Bytes(), &points); err != nil {
+		t.Fatalf("decode trend summary: %v", err)
+	}
+	if len(points) != 1 || points[0].Upload != 15 || points[0].Download != 25 {
+		t.Fatalf("unexpected trend summary response: %+v", points)
+	}
+
+	req = httptest.NewRequest(
+		http.MethodGet,
+		"/api/traffic/details?dimension=sourceIP&primary=192.168.1.8&secondary=api.example.com&start="+strconv.FormatInt(start, 10)+"&end="+strconv.FormatInt(end, 10)+"&summary=1",
+		nil,
+	)
+	rec = httptest.NewRecorder()
+	svc.routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("details summary status: %d body=%s", rec.Code, rec.Body.String())
+	}
+	var details []connectionDetail
+	if err := json.Unmarshal(rec.Body.Bytes(), &details); err != nil {
+		t.Fatalf("decode details summary: %v", err)
+	}
+	if len(details) != 0 {
+		t.Fatalf("expected summary details to be empty, got %+v", details)
+	}
+}
+
 func TestQueryTrendRebucketsAggregatedMinuteData(t *testing.T) {
 	svc := newTestService(t)
 
@@ -2683,6 +3058,13 @@ func TestHandleLogsClearsAggregatesAndBuffer(t *testing.T) {
 		{BucketStart: 0, BucketEnd: 60_000, SourceIP: "192.168.1.2", Host: "a.com", Process: "chrome", Outbound: "NodeA", Chains: `["DIRECT"]`, Upload: 100, Download: 200, Count: 1},
 	})
 	svc.aggregateBuffer["pending"] = &aggregatedEntry{BucketStart: 60_000, BucketEnd: 120_000, SourceIP: "192.168.1.2"}
+	if _, err := svc.db.Exec(`
+		INSERT INTO traffic_summary
+		(bucket_start, bucket_end, dimension, label, secondary_label, upload, download, count)
+		VALUES (0, 60000, 'source_ip', '192.168.1.2', 'a.com', 100, 200, 1)
+	`); err != nil {
+		t.Fatalf("insert traffic_summary: %v", err)
+	}
 
 	req := httptest.NewRequest(http.MethodDelete, "/api/traffic/logs", nil)
 	rec := httptest.NewRecorder()
@@ -2707,6 +3089,14 @@ func TestHandleLogsClearsAggregatesAndBuffer(t *testing.T) {
 	}
 	if aggregateCount != 0 {
 		t.Fatalf("expected traffic_aggregated to be empty, got %d rows", aggregateCount)
+	}
+
+	var summaryCount int
+	if err := svc.db.QueryRow(`SELECT COUNT(*) FROM traffic_summary`).Scan(&summaryCount); err != nil {
+		t.Fatalf("count traffic_summary: %v", err)
+	}
+	if summaryCount != 0 {
+		t.Fatalf("expected traffic_summary to be empty, got %d rows", summaryCount)
 	}
 
 	if len(svc.aggregateBuffer) != 0 {
@@ -2928,6 +3318,40 @@ func TestEmbeddedIndexDisablesPeriodicAutoRefresh(t *testing.T) {
 	}
 }
 
+func TestEmbeddedIndexIncludesDirectTrafficFilterToggle(t *testing.T) {
+	content, err := webAssets.ReadFile("web/index.html")
+	if err != nil {
+		t.Fatalf("read embedded index.html: %v", err)
+	}
+	html := string(content)
+
+	scriptContent, err := webAssets.ReadFile("web/app.js")
+	if err != nil {
+		t.Fatalf("read embedded app.js: %v", err)
+	}
+	script := string(scriptContent)
+
+	for _, want := range []string{
+		`id="filterDirectTraffic"`,
+		"过滤 DIRECT 直连流量",
+	} {
+		if !strings.Contains(html, want) {
+			t.Fatalf("expected embedded index.html to contain %q", want)
+		}
+	}
+
+	for _, want := range []string{
+		`filterDirectTraffic: document.getElementById("filterDirectTraffic")`,
+		`elements.filterDirectTraffic.checked = Boolean(state.filterDirectTraffic)`,
+		`fetchJSON("/api/settings/direct-traffic-filter")`,
+		`sendJSON("/api/settings/direct-traffic-filter", "PUT", directFilterPayload)`,
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("expected embedded app.js to contain %q", want)
+		}
+	}
+}
+
 func TestEmbeddedIndexIncludesGithubAndLicenseFooter(t *testing.T) {
 	content, err := webAssets.ReadFile("web/index.html")
 	if err != nil {
@@ -2966,6 +3390,67 @@ func TestEmbeddedIndexIncludesGithubAndLicenseFooter(t *testing.T) {
 			t.Fatalf("expected embedded index.html to contain %q", want)
 		}
 	}
+}
+
+func TestEmbeddedSummaryModeMarkers(t *testing.T) {
+	indexContent, err := webAssets.ReadFile("web/index.html")
+	if err != nil {
+		t.Fatalf("read embedded index.html: %v", err)
+	}
+	html := string(indexContent)
+
+	scriptContent, err := webAssets.ReadFile("web/app.js")
+	if err != nil {
+		t.Fatalf("read embedded app.js: %v", err)
+	}
+	script := string(scriptContent)
+
+	styleContent, err := webAssets.ReadFile("web/styles.css")
+	if err != nil {
+		t.Fatalf("read embedded styles.css: %v", err)
+	}
+	styles := string(styleContent)
+
+	for _, want := range []string{
+		`class="mode-switch"`,
+		`data-mode="summary"`,
+		`id="secondaryChart"`,
+	} {
+		if !strings.Contains(html, want) {
+			t.Fatalf("expected embedded index.html to contain %q", want)
+		}
+	}
+	for _, want := range []string{
+		"MODE_STORAGE_KEY",
+		"function renderSecondaryChart(",
+		"function renderPrimaryChart(",
+		`const summary = state.mode === "summary" ? "1" : ""`,
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("expected embedded app.js to contain %q", want)
+		}
+	}
+	// Detail/summary mode switches rewrite the range select; the start/end
+	// pickers must be refreshed so they match the range actually queried.
+	syncRangeOptions := extractJSFunction(script, "syncRangeOptions")
+	if !strings.Contains(syncRangeOptions, "updateCustomInputs()") {
+		t.Fatalf("expected syncRangeOptions() to refresh custom time inputs after changing the range")
+	}
+	if !strings.Contains(styles, "body.summary-mode") {
+		t.Fatalf("expected embedded styles.css to include summary mode layout rules")
+	}
+}
+
+func extractJSFunction(script, name string) string {
+	start := strings.Index(script, "function "+name+"(")
+	if start < 0 {
+		return ""
+	}
+	next := strings.Index(script[start:], "\nfunction ")
+	if next < 0 {
+		return script[start:]
+	}
+	return script[start : start+next]
 }
 
 func TestEmbeddedTrendChartIncludesAxisAndTooltip(t *testing.T) {
@@ -3190,15 +3675,34 @@ func newTestService(t *testing.T) *service {
 		_ = db.Close()
 	})
 
+	return newTestServiceOnDB(db)
+}
+
+func newTestServiceOnDB(db *sql.DB) *service {
 	return &service{
 		db:                     db,
 		now:                    time.Now,
 		domainGroupingEnabled:  loadDomainGroupingEnabled(db),
+		filterDirectTraffic:    loadFilterDirectTraffic(db),
 		aggregateRetentionDays: loadRetentionDays(db),
 		lastConnections:        make(map[string]connection),
 		aggregateBuffer:        make(map[string]*aggregatedEntry),
 		hostMinuteWindows:      make(map[string]*hostTrafficWindow),
 	}
+}
+
+func testConnection(id string, chains []string, upload, download int64) connection {
+	conn := connection{
+		ID:       id,
+		Upload:   upload,
+		Download: download,
+		Chains:   chains,
+	}
+	conn.Metadata.SourceIP = "192.168.1.2"
+	conn.Metadata.Host = "example.com"
+	conn.Metadata.DestinationIP = "1.1.1.1"
+	conn.Metadata.Process = "chrome"
+	return conn
 }
 
 func insertTestLogs(t *testing.T, db *sql.DB, logs []trafficLog) {
@@ -3210,9 +3714,14 @@ func insertTestLogs(t *testing.T, db *sql.DB, logs []trafficLog) {
 			t.Fatalf("marshal chains: %v", err)
 		}
 
+		ruleGroup := entry.RuleGroup
+		if ruleGroup == "" {
+			ruleGroup = unknownRuleGroup
+		}
+
 		_, err = db.Exec(
-			`INSERT INTO traffic_logs (timestamp, source_ip, host, destination_ip, process, outbound, chains, upload, download)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			`INSERT INTO traffic_logs (timestamp, source_ip, host, destination_ip, process, outbound, chains, rule_group, upload, download)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			entry.Timestamp,
 			entry.SourceIP,
 			entry.Host,
@@ -3220,6 +3729,7 @@ func insertTestLogs(t *testing.T, db *sql.DB, logs []trafficLog) {
 			entry.Process,
 			entry.Outbound,
 			string(chainsRaw),
+			ruleGroup,
 			entry.Upload,
 			entry.Download,
 		)
@@ -3233,10 +3743,15 @@ func insertTestAggregates(t *testing.T, db *sql.DB, entries []aggregatedEntry) {
 	t.Helper()
 
 	for _, entry := range entries {
+		ruleGroup := entry.RuleGroup
+		if ruleGroup == "" {
+			ruleGroup = unknownRuleGroup
+		}
+
 		_, err := db.Exec(
 			`INSERT INTO traffic_aggregated
-			 (bucket_start, bucket_end, source_ip, host, destination_ip, process, outbound, chains, upload, download, count)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			 (bucket_start, bucket_end, source_ip, host, destination_ip, process, outbound, chains, rule_group, upload, download, count)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			entry.BucketStart,
 			entry.BucketEnd,
 			entry.SourceIP,
@@ -3245,6 +3760,7 @@ func insertTestAggregates(t *testing.T, db *sql.DB, entries []aggregatedEntry) {
 			entry.Process,
 			entry.Outbound,
 			entry.Chains,
+			ruleGroup,
 			entry.Upload,
 			entry.Download,
 			entry.Count,
@@ -3354,6 +3870,72 @@ func TestHandleDomainGroupingSettings(t *testing.T) {
 
 	t.Run("DELETE returns 405", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodDelete, "/api/settings/domain-grouping", nil)
+		rec := httptest.NewRecorder()
+		svc.routes().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("expected 405, got %d", rec.Code)
+		}
+	})
+}
+
+func TestHandleDirectTrafficFilterSettings(t *testing.T) {
+	svc := newTestService(t)
+
+	t.Run("GET returns default false", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/settings/direct-traffic-filter", nil)
+		rec := httptest.NewRecorder()
+		svc.routes().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET status %d: %s", rec.Code, rec.Body.String())
+		}
+		var resp map[string]interface{}
+		if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if resp["enabled"] != false {
+			t.Fatalf("expected enabled=false, got %v", resp["enabled"])
+		}
+	})
+
+	t.Run("PUT sets true", func(t *testing.T) {
+		body := bytes.NewBufferString(`{"enabled":true}`)
+		req := httptest.NewRequest(http.MethodPut, "/api/settings/direct-traffic-filter", body)
+		rec := httptest.NewRecorder()
+		svc.routes().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("PUT status %d: %s", rec.Code, rec.Body.String())
+		}
+		var resp map[string]interface{}
+		if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if resp["enabled"] != true {
+			t.Fatalf("expected enabled=true, got %v", resp["enabled"])
+		}
+		if !svc.currentFilterDirectTraffic() {
+			t.Fatal("expected in-memory state to be true")
+		}
+		if !loadFilterDirectTraffic(svc.db) {
+			t.Fatal("expected the setting to be persisted")
+		}
+	})
+
+	t.Run("PUT bad JSON returns 400", func(t *testing.T) {
+		body := bytes.NewBufferString(`not-json`)
+		req := httptest.NewRequest(http.MethodPut, "/api/settings/direct-traffic-filter", body)
+		rec := httptest.NewRecorder()
+		svc.routes().ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400, got %d", rec.Code)
+		}
+	})
+
+	t.Run("DELETE returns 405", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodDelete, "/api/settings/direct-traffic-filter", nil)
 		rec := httptest.NewRecorder()
 		svc.routes().ServeHTTP(rec, req)
 
@@ -3649,5 +4231,640 @@ func TestConnectionDetailsSubdomainSecondary(t *testing.T) {
 	}
 	if details[0].SourceIP != "192.168.1.9" || details[0].DestinationIP != "64.233.170.91" {
 		t.Fatalf("unexpected grouped IP host detail row: %+v", details[0])
+	}
+}
+
+func TestRuleGroupLabel(t *testing.T) {
+	cases := []struct {
+		name    string
+		rule    string
+		payload string
+		want    string
+	}{
+		{name: "empty rule", want: "unknown"},
+		{name: "real match rule shown", rule: "MATCH", payload: "", want: "match"},
+		{name: "match rule no payload", rule: "MATCH", want: "match"},
+		{name: "geosite", rule: "GeoSite", payload: "telegram", want: "geosite:telegram"},
+		{name: "geoip keeps payload case", rule: "GeoIP", payload: "CN", want: "geoip:CN"},
+		{name: "domain suffix", rule: "DOMAIN-SUFFIX", payload: "telegram.org", want: "domain-suffix:telegram.org"},
+		{name: "rule type only", rule: "MATCH", payload: " ", want: "match"},
+		{name: "whitespace trimmed", rule: "  GeoSite  ", payload: "  telegram  ", want: "geosite:telegram"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ruleGroupLabel(tc.rule, tc.payload); got != tc.want {
+				t.Fatalf("ruleGroupLabel(%q, %q) = %q, want %q", tc.rule, tc.payload, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestProcessConnectionsCapturesRuleGroup(t *testing.T) {
+	svc := newTestService(t)
+
+	payload := &connectionsResponse{
+		Connections: []connection{
+			{
+				ID:          "conn-tg",
+				Upload:      128,
+				Download:    256,
+				Chains:      []string{"ProxyA"},
+				Rule:        "GeoSite",
+				RulePayload: "telegram",
+				Metadata: struct {
+					SourceIP      string "json:\"sourceIP\""
+					Host          string "json:\"host\""
+					DestinationIP string "json:\"destinationIP\""
+					Process       string "json:\"process\""
+				}{
+					SourceIP:      "192.168.1.8",
+					Host:          "91.108.56.108",
+					DestinationIP: "91.108.56.108",
+					Process:       "Telegram",
+				},
+			},
+			{
+				ID:          "conn-ip",
+				Upload:      10,
+				Download:    20,
+				Chains:      []string{"DIRECT"},
+				Rule:        "GeoIP",
+				RulePayload: "CN",
+				Metadata: struct {
+					SourceIP      string "json:\"sourceIP\""
+					Host          string "json:\"host\""
+					DestinationIP string "json:\"destinationIP\""
+					Process       string "json:\"process\""
+				}{
+					SourceIP:      "192.168.1.8",
+					Host:          "223.5.5.5",
+					DestinationIP: "223.5.5.5",
+					Process:       "curl",
+				},
+			},
+			{
+				ID:       "conn-plain",
+				Upload:   5,
+				Download: 5,
+				Chains:   []string{"DIRECT"},
+				Metadata: struct {
+					SourceIP      string "json:\"sourceIP\""
+					Host          string "json:\"host\""
+					DestinationIP string "json:\"destinationIP\""
+					Process       string "json:\"process\""
+				}{
+					SourceIP: "192.168.1.8",
+					Host:     "localhost.localdomain",
+				},
+			},
+		},
+	}
+
+	if err := svc.processConnections(context.Background(), payload); err != nil {
+		t.Fatalf("processConnections: %v", err)
+	}
+
+	want := map[string]int64{
+		"geosite:telegram": 1,
+		"geoip:CN":         1,
+		unknownRuleGroup:   1,
+	}
+	got := make(map[string]int64)
+	for _, entry := range svc.aggregateBuffer {
+		got[entry.RuleGroup]++
+	}
+	if len(got) != len(want) {
+		t.Fatalf("expected rule groups %v, got %v", want, got)
+	}
+	for rule, count := range want {
+		if got[rule] != count {
+			t.Errorf("rule group %q: expected %d entries, got %d", rule, count, got[rule])
+		}
+	}
+}
+
+func TestQueryAggregateRuleDimension(t *testing.T) {
+	svc := newTestService(t)
+	insertTestAggregates(t, svc.db, []aggregatedEntry{
+		{BucketStart: 0, BucketEnd: 60_000, SourceIP: "192.168.1.2", Host: "91.108.56.108", DestinationIP: "91.108.56.108", Outbound: "NodeA", Chains: `["NodeA"]`, RuleGroup: "geosite:telegram", Upload: 100, Download: 200, Count: 1},
+		{BucketStart: 0, BucketEnd: 60_000, SourceIP: "192.168.1.2", Host: "t.me", Outbound: "NodeA", Chains: `["NodeA"]`, RuleGroup: "geosite:telegram", Upload: 50, Download: 80, Count: 2},
+		{BucketStart: 0, BucketEnd: 60_000, SourceIP: "192.168.1.2", Host: "223.5.5.5", Outbound: "DIRECT", Chains: `["DIRECT"]`, RuleGroup: "geoip:CN", Upload: 10, Download: 20, Count: 1},
+	})
+	svc.aggregateBuffer["pending"] = &aggregatedEntry{
+		BucketStart: 60_000, BucketEnd: 120_000, SourceIP: "192.168.1.2", Host: "example.com", Outbound: "NodeA", Chains: `["NodeA"]`, RuleGroup: "geosite:telegram", Upload: 7, Download: 9, Count: 1,
+	}
+
+	rows, err := svc.queryAggregate("rule", 0, 120_000, false)
+	if err != nil {
+		t.Fatalf("queryAggregate(rule): %v", err)
+	}
+
+	byLabel := make(map[string]aggregatedData)
+	for _, r := range rows {
+		byLabel[r.Label] = r
+	}
+
+	tg, ok := byLabel["geosite:telegram"]
+	if !ok {
+		t.Fatalf("expected geosite:telegram row, got %v", rows)
+	}
+	if tg.Upload != 157 || tg.Download != 289 || tg.Total != 446 || tg.Count != 4 {
+		t.Errorf("geosite:telegram unexpected totals: %+v", tg)
+	}
+
+	cn, ok := byLabel["geoip:CN"]
+	if !ok {
+		t.Fatalf("expected geoip:CN row, got %v", rows)
+	}
+	if cn.Upload != 10 || cn.Download != 20 {
+		t.Errorf("geoip:CN unexpected totals: %+v", cn)
+	}
+
+	if len(rows) != 2 {
+		t.Errorf("expected 2 rule rows, got %d: %v", len(rows), rows)
+	}
+
+	// Secondary drilldown: hosts matching one rule group.
+	hosts, err := svc.querySubstats("rule", "geosite:telegram", 0, 120_000)
+	if err != nil {
+		t.Fatalf("querySubstats(rule): %v", err)
+	}
+	hostLabels := make(map[string]bool)
+	for _, h := range hosts {
+		hostLabels[h.Label] = true
+	}
+	if !hostLabels["91.108.56.108"] || !hostLabels["t.me"] || !hostLabels["example.com"] {
+		t.Errorf("expected telegram hosts, got %v", hostLabels)
+	}
+
+	// Detail drilldown: one host under one rule group.
+	details, err := svc.queryConnectionDetails("rule", "geosite:telegram", "91.108.56.108", 0, 120_000)
+	if err != nil {
+		t.Fatalf("queryConnectionDetails(rule): %v", err)
+	}
+	if len(details) != 1 || details[0].DestinationIP != "91.108.56.108" {
+		t.Errorf("unexpected rule detail rows: %+v", details)
+	}
+}
+
+func TestQuerySummaryRuleDimension(t *testing.T) {
+	svc := newTestService(t)
+
+	day := int64(24 * time.Hour / time.Millisecond)
+	now := time.Date(2026, 8, 6, 15, 0, 0, 0, time.Local).UnixMilli()
+	dayStart := (now / day) * day
+	insertTestAggregates(t, svc.db, []aggregatedEntry{
+		{
+			BucketStart: dayStart - day,
+			BucketEnd:   dayStart - day + 60000,
+			SourceIP:    "192.168.1.8",
+			Host:        "91.108.56.108",
+			Outbound:    "ProxyA",
+			Chains:      `["ProxyA"]`,
+			RuleGroup:   "geosite:telegram",
+			Upload:      15,
+			Download:    25,
+			Count:       1,
+		},
+	})
+	if err := backfillSummary(svc.db, now); err != nil {
+		t.Fatalf("backfillSummary: %v", err)
+	}
+
+	start := dayStart - day
+	end := dayStart - 1
+
+	rows, err := svc.querySummaryAggregate("rule", start, end, false)
+	if err != nil {
+		t.Fatalf("querySummaryAggregate(rule): %v", err)
+	}
+	if len(rows) != 1 || rows[0].Label != "geosite:telegram" || rows[0].Upload != 15 || rows[0].Download != 25 {
+		t.Fatalf("unexpected rule summary: %+v", rows)
+	}
+
+	hosts, err := svc.querySummarySecondary("rule", "geosite:telegram", start, end)
+	if err != nil {
+		t.Fatalf("querySummarySecondary(rule): %v", err)
+	}
+	if len(hosts) != 1 || hosts[0].Label != "91.108.56.108" {
+		t.Fatalf("unexpected rule secondary summary: %+v", hosts)
+	}
+}
+
+func TestOpenDatabaseUpgradesLegacySchemaWithoutRuleGroup(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "legacy.db")
+
+	db, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	_, err = db.Exec(`
+		CREATE TABLE traffic_logs (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			timestamp INTEGER NOT NULL,
+			source_ip TEXT NOT NULL,
+			host TEXT NOT NULL,
+			destination_ip TEXT NOT NULL DEFAULT '',
+			process TEXT NOT NULL,
+			outbound TEXT NOT NULL,
+			chains TEXT NOT NULL DEFAULT '[]',
+			upload INTEGER NOT NULL,
+			download INTEGER NOT NULL
+		);
+		CREATE TABLE traffic_aggregated (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			bucket_start INTEGER NOT NULL,
+			bucket_end INTEGER NOT NULL,
+			source_ip TEXT NOT NULL,
+			host TEXT NOT NULL,
+			destination_ip TEXT NOT NULL DEFAULT '',
+			process TEXT NOT NULL,
+			outbound TEXT NOT NULL,
+			chains TEXT NOT NULL DEFAULT '[]',
+			upload INTEGER NOT NULL,
+			download INTEGER NOT NULL,
+			count INTEGER NOT NULL,
+			UNIQUE(bucket_start, bucket_end, source_ip, host, destination_ip, process, outbound, chains)
+		);
+	`)
+	if err != nil {
+		db.Close()
+		t.Fatalf("create legacy schema: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close legacy db: %v", err)
+	}
+
+	opened, err := openDatabase(path)
+	if err != nil {
+		t.Fatalf("openDatabase on legacy db: %v", err)
+	}
+	defer opened.Close()
+
+	for _, table := range []string{"traffic_logs", "traffic_aggregated"} {
+		var count int
+		if err := opened.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('` + table + `') WHERE name = 'rule_group'`).Scan(&count); err != nil {
+			t.Fatalf("check rule_group in %s: %v", table, err)
+		}
+		if count != 1 {
+			t.Errorf("expected rule_group column in %s after upgrade, got %d", table, count)
+		}
+	}
+}
+
+func TestOpenDatabaseDropsLegacyTrafficLogsPerColumnIndexes(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "legacy.db")
+
+	db, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	_, err = db.Exec(`
+		CREATE TABLE traffic_logs (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			timestamp INTEGER NOT NULL,
+			source_ip TEXT NOT NULL,
+			host TEXT NOT NULL,
+			destination_ip TEXT NOT NULL DEFAULT '',
+			process TEXT NOT NULL,
+			outbound TEXT NOT NULL,
+			chains TEXT NOT NULL DEFAULT '[]',
+			rule_group TEXT NOT NULL DEFAULT 'unknown',
+			upload INTEGER NOT NULL,
+			download INTEGER NOT NULL
+		);
+		CREATE INDEX idx_traffic_logs_timestamp ON traffic_logs(timestamp);
+		CREATE INDEX idx_traffic_logs_source_ip ON traffic_logs(source_ip);
+		CREATE INDEX idx_traffic_logs_host ON traffic_logs(host);
+		CREATE INDEX idx_traffic_logs_process ON traffic_logs(process);
+		CREATE INDEX idx_traffic_logs_outbound ON traffic_logs(outbound);
+		CREATE INDEX idx_traffic_logs_rule_group ON traffic_logs(rule_group);
+	`)
+	if err != nil {
+		db.Close()
+		t.Fatalf("create legacy schema: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close legacy db: %v", err)
+	}
+
+	opened, err := openDatabase(path)
+	if err != nil {
+		t.Fatalf("openDatabase on legacy db: %v", err)
+	}
+	defer opened.Close()
+
+	rows, err := opened.Query(`PRAGMA index_list(traffic_logs)`)
+	if err != nil {
+		t.Fatalf("index_list: %v", err)
+	}
+	defer rows.Close()
+
+	indexes := map[string]bool{}
+	for rows.Next() {
+		var (
+			seq     int
+			name    string
+			unique  int
+			origin  string
+			partial int
+		)
+		if err := rows.Scan(&seq, &name, &unique, &origin, &partial); err != nil {
+			t.Fatalf("scan index_list: %v", err)
+		}
+		indexes[name] = true
+	}
+
+	for _, dropped := range []string{
+		"idx_traffic_logs_source_ip",
+		"idx_traffic_logs_host",
+		"idx_traffic_logs_process",
+		"idx_traffic_logs_outbound",
+		"idx_traffic_logs_rule_group",
+	} {
+		if indexes[dropped] {
+			t.Errorf("expected legacy index %q to be dropped", dropped)
+		}
+	}
+	if !indexes["idx_traffic_logs_timestamp"] {
+		t.Errorf("expected idx_traffic_logs_timestamp to be kept")
+	}
+}
+
+func TestRuleDimensionHidesUnknownButShowsMatch(t *testing.T) {
+	svc := newTestService(t)
+	insertTestAggregates(t, svc.db, []aggregatedEntry{
+		{BucketStart: 0, BucketEnd: 60_000, SourceIP: "192.168.1.2", Host: "91.108.56.108", Outbound: "NodeA", Chains: `["NodeA"]`, RuleGroup: "geosite:telegram", Upload: 100, Download: 200, Count: 1},
+		{BucketStart: 0, BucketEnd: 60_000, SourceIP: "192.168.1.2", Host: "catchall.example.com", Outbound: "NodeB", Chains: `["NodeB"]`, RuleGroup: "match", Upload: 50, Download: 60, Count: 1},
+		{BucketStart: 0, BucketEnd: 60_000, SourceIP: "192.168.1.2", Host: "old.example.com", Outbound: "DIRECT", Chains: `["DIRECT"]`, RuleGroup: "unknown", Upload: 500, Download: 700, Count: 1},
+	})
+
+	// Detail mode: legacy "unknown" is hidden; real catch-all "match" stays.
+	rows, err := svc.queryAggregate("rule", 0, 60_000, false)
+	if err != nil {
+		t.Fatalf("queryAggregate(rule): %v", err)
+	}
+	byLabel := make(map[string]aggregatedData)
+	for _, r := range rows {
+		byLabel[r.Label] = r
+	}
+	if len(rows) != 2 {
+		t.Fatalf("expected geosite:telegram + match, got %+v", rows)
+	}
+	if _, ok := byLabel[unknownRuleGroup]; ok {
+		t.Fatalf("legacy unknown group should be hidden, got %+v", rows)
+	}
+	if m, ok := byLabel["match"]; !ok || m.Upload != 50 {
+		t.Fatalf("real match group should be shown, got %+v", rows)
+	}
+
+	// Summary mode: same behavior after backfill.
+	day := int64(24 * time.Hour / time.Millisecond)
+	now := time.Date(2026, 8, 6, 15, 0, 0, 0, time.Local).UnixMilli()
+	dayStart := (now / day) * day
+	insertTestAggregates(t, svc.db, []aggregatedEntry{
+		{BucketStart: dayStart - day, BucketEnd: dayStart - day + 60000, SourceIP: "192.168.1.2", Host: "new.example.com", Outbound: "NodeA", Chains: `["NodeA"]`, RuleGroup: "geoip:CN", Upload: 10, Download: 20, Count: 1},
+		{BucketStart: dayStart - day, BucketEnd: dayStart - day + 60000, SourceIP: "192.168.1.2", Host: "catchall2.example.com", Outbound: "NodeB", Chains: `["NodeB"]`, RuleGroup: "match", Upload: 7, Download: 8, Count: 1},
+		{BucketStart: dayStart - day, BucketEnd: dayStart - day + 60000, SourceIP: "192.168.1.2", Host: "old2.example.com", Outbound: "DIRECT", Chains: `["DIRECT"]`, RuleGroup: "unknown", Upload: 99, Download: 99, Count: 1},
+	})
+	if err := backfillSummary(svc.db, now); err != nil {
+		t.Fatalf("backfillSummary: %v", err)
+	}
+	summaryRows, err := svc.querySummaryAggregate("rule", dayStart-day, dayStart-1, false)
+	if err != nil {
+		t.Fatalf("querySummaryAggregate(rule): %v", err)
+	}
+	summaryByLabel := make(map[string]aggregatedData)
+	for _, r := range summaryRows {
+		summaryByLabel[r.Label] = r
+	}
+	if len(summaryRows) != 2 {
+		t.Fatalf("expected geoip:CN + match in summary, got %+v", summaryRows)
+	}
+	if _, ok := summaryByLabel[unknownRuleGroup]; ok {
+		t.Fatalf("legacy unknown group should be hidden in summary, got %+v", summaryRows)
+	}
+	if m, ok := summaryByLabel["match"]; !ok || m.Upload != 7 {
+		t.Fatalf("real match group should be shown in summary, got %+v", summaryRows)
+	}
+}
+
+func TestLegacyMatchRowsRelabeledOnce(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "upgrade.db")
+
+	// Simulate a database already migrated by the first rule_group build:
+	// openDatabase creates the full schema, then we force user_version back to
+	// 0 and insert rows labelled "match" (the old default for legacy data).
+	opened, err := openDatabase(path)
+	if err != nil {
+		t.Fatalf("openDatabase: %v", err)
+	}
+	if _, err := opened.Exec(`PRAGMA user_version = 0`); err != nil {
+		opened.Close()
+		t.Fatalf("reset user_version: %v", err)
+	}
+	if _, err := opened.Exec(`
+		INSERT INTO traffic_aggregated (bucket_start, bucket_end, source_ip, host, destination_ip, process, outbound, chains, rule_group, upload, download, count)
+		VALUES (0, 60000, '192.168.1.2', 'old.example.com', '', 'curl', 'DIRECT', '["DIRECT"]', 'match', 10, 20, 1);
+		INSERT INTO traffic_logs (timestamp, source_ip, host, destination_ip, process, outbound, chains, rule_group, upload, download)
+		VALUES (1000, '192.168.1.2', 'old.example.com', '', 'curl', 'DIRECT', '["DIRECT"]', 'match', 10, 20);
+		INSERT INTO traffic_summary (bucket_start, bucket_end, dimension, label, secondary_label, upload, download, count)
+		VALUES (0, 60000, 'rule', 'match', 'old.example.com', 10, 20, 1);
+	`); err != nil {
+		opened.Close()
+		t.Fatalf("insert legacy match rows: %v", err)
+	}
+	if err := opened.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	// Reopen: the one-time re-label should convert legacy "match" rows to
+	// "unknown" (hidden) and bump user_version so a real MATCH rule is never
+	// relabelled on subsequent starts.
+	reopened, err := openDatabase(path)
+	if err != nil {
+		t.Fatalf("reopenDatabase: %v", err)
+	}
+	defer reopened.Close()
+
+	var version int
+	if err := reopened.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+		t.Fatalf("read user_version: %v", err)
+	}
+	if version != 1 {
+		t.Fatalf("expected user_version 1 after migration, got %d", version)
+	}
+
+	for _, stmt := range []string{
+		`SELECT COUNT(*) FROM traffic_aggregated WHERE rule_group = 'match'`,
+		`SELECT COUNT(*) FROM traffic_logs WHERE rule_group = 'match'`,
+		`SELECT COUNT(*) FROM traffic_summary WHERE dimension = 'rule' AND label = 'match'`,
+	} {
+		var count int
+		if err := reopened.QueryRow(stmt).Scan(&count); err != nil {
+			t.Fatalf("count match rows: %v", err)
+		}
+		if count != 0 {
+			t.Errorf("expected no 'match' rows left, got %d for %q", count, stmt)
+		}
+	}
+
+	var unknown int
+	if err := reopened.QueryRow(`SELECT COUNT(*) FROM traffic_aggregated WHERE rule_group = 'unknown'`).Scan(&unknown); err != nil {
+		t.Fatalf("count unknown rows: %v", err)
+	}
+	if unknown != 1 {
+		t.Errorf("expected 1 unknown aggregate row after relabel, got %d", unknown)
+	}
+}
+
+func TestApplicationServesAndShutsDownIdempotently(t *testing.T) {
+	app, err := newApplication(config{ListenAddr: "127.0.0.1:0"}, filepath.Join(t.TempDir(), "traffic.db"))
+	if err != nil {
+		t.Fatalf("newApplication: %v", err)
+	}
+
+	app.start()
+
+	resp, err := http.Get(fmt.Sprintf("http://%s/health", app.listener.Addr()))
+	if err != nil {
+		t.Fatalf("health request: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || !strings.Contains(string(body), "ok") {
+		t.Fatalf("unexpected health response: %d %s", resp.StatusCode, body)
+	}
+
+	if err := app.shutdown(); err != nil {
+		t.Fatalf("first shutdown: %v", err)
+	}
+	if err := app.shutdown(); err != nil {
+		t.Fatalf("second shutdown must be idempotent: %v", err)
+	}
+
+	if _, err := http.Get(fmt.Sprintf("http://%s/health", app.listener.Addr())); err == nil {
+		t.Fatal("expected server to refuse connections after shutdown")
+	}
+}
+
+func TestApplicationPortConflictFailsSynchronously(t *testing.T) {
+	blocker, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("blocker listen: %v", err)
+	}
+	defer blocker.Close()
+
+	app, err := newApplication(config{ListenAddr: blocker.Addr().String()}, filepath.Join(t.TempDir(), "traffic.db"))
+	if err == nil {
+		app.shutdown()
+		t.Fatal("expected newApplication to fail while the port is occupied")
+	}
+	if app != nil {
+		t.Fatal("expected nil application on listen failure")
+	}
+}
+
+func TestApplicationServerErrorReachesErrorsChannel(t *testing.T) {
+	app, err := newApplication(config{ListenAddr: "127.0.0.1:0"}, filepath.Join(t.TempDir(), "traffic.db"))
+	if err != nil {
+		t.Fatalf("newApplication: %v", err)
+	}
+
+	app.start()
+	if err := app.listener.Close(); err != nil {
+		t.Fatalf("close listener: %v", err)
+	}
+
+	select {
+	case err := <-app.errors():
+		if err == nil {
+			t.Fatal("expected non-nil server error")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for server error")
+	}
+
+	if err := app.shutdown(); err != nil {
+		t.Fatalf("shutdown after server error: %v", err)
+	}
+}
+
+func TestApplicationShutdownSkipsFlushWhenCollectorStuck(t *testing.T) {
+	svc := newTestService(t)
+
+	previousTimeout := collectorShutdownTimeout
+	collectorShutdownTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { collectorShutdownTimeout = previousTimeout })
+
+	bucketStart := (time.Now().UnixMilli() / 60000) * 60000
+	svc.aggregateBuffer["stuck"] = &aggregatedEntry{
+		BucketStart: bucketStart,
+		BucketEnd:   bucketStart + 60000,
+		SourceIP:    "192.168.1.2",
+		Host:        "stuck.example",
+		Process:     "chrome",
+		Outbound:    "DIRECT",
+		Chains:      `["DIRECT"]`,
+		RuleGroup:   unknownRuleGroup,
+		Upload:      10,
+		Download:    5,
+		Count:       1,
+	}
+
+	app := &application{
+		cfg:           config{ListenAddr: "127.0.0.1:0"},
+		db:            svc.db,
+		svc:           svc,
+		server:        &http.Server{Handler: svc.routes(), ReadHeaderTimeout: 5 * time.Second},
+		ctx:           context.Background(),
+		cancel:        func() {},
+		collectorDone: make(chan struct{}),
+		serverErr:     make(chan error, 1),
+	}
+
+	err := app.shutdown()
+	if err == nil {
+		t.Fatal("expected shutdown error while the collector is stuck")
+	}
+	if !strings.Contains(err.Error(), "skipping final flush") {
+		t.Fatalf("expected skip-final-flush error, got %v", err)
+	}
+
+	var flushed int
+	if err := svc.db.QueryRow(`SELECT COUNT(*) FROM traffic_aggregated`).Scan(&flushed); err != nil {
+		t.Fatalf("query aggregated after skipped flush: %v", err)
+	}
+	if flushed != 0 {
+		t.Fatalf("expected no aggregates flushed during timed-out shutdown, got %d", flushed)
+	}
+}
+
+func TestExecuteAutoSwitchRespectsContextCancellation(t *testing.T) {
+	svc := newTestService(t)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer ts.Close()
+
+	svc.setMihomoSettings(mihomoSettings{URL: ts.URL})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		cancel()
+	}()
+
+	target := autoSwitchGroupTarget{GroupName: "G", TargetProxy: "P", Enabled: true}
+	_, err := svc.executeAutoSwitch(ctx, autoSwitchSettings{Enabled: true, GroupTargets: []autoSwitchGroupTarget{target}}, target, time.Now().UnixMilli(), "example.com", 100)
+	if err == nil {
+		t.Fatal("expected context cancellation error from blocked auto switch request")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
 	}
 }

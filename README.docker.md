@@ -10,8 +10,6 @@ docker run -d \
   --name traffic-monitor \
   --restart unless-stopped \
   -p 8080:8080 \
-  -e MIHOMO_URL=http://host.docker.internal:9090 \
-  -e MIHOMO_SECRET=your-secret \
   -v "$(pwd)/data:/data" \
   zhf883680/clash-traffic-monitor:latest
 ```
@@ -21,14 +19,6 @@ docker run -d \
 ```text
 http://localhost:8080/
 ```
-
-## 常用环境变量
-
-| 变量名 | 默认值 | 说明 |
-| --- | --- | --- |
-| `MIHOMO_URL` | `http://127.0.0.1:9090` | Mihomo Controller 地址 |
-| `MIHOMO_SECRET` | 空 | Mihomo Bearer Token |
-| `TRAFFIC_MONITOR_DB` | `./traffic_monitor.db` | 数据库路径 |
 
 ## 页面预览
 
