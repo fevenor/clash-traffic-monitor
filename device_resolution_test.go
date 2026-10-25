@@ -42,9 +42,9 @@ func newTestServiceWithUbus(t *testing.T, ubusServerURL string) *service {
 
 // ubusMockResponse 定义 ubus mock 对特定调用的响应。
 type ubusMockResponse struct {
-	Data    any             // 成功时的数据（成为 [0, data] 的第二元素）
-	RPCErr  *ubusRPCError   // 非空时返回 RPC 层错误
-	HTTPErr error           // 非空时返回 HTTP 层错误
+	Data    any           // 成功时的数据（成为 [0, data] 的第二元素）
+	RPCErr  *ubusRPCError // 非空时返回 RPC 层错误
+	HTTPErr error         // 非空时返回 HTTP 层错误
 }
 
 // ---------------------------------------------------------------------------
@@ -478,9 +478,9 @@ func TestMACAggregate(t *testing.T) {
 		})
 
 		data := []aggregatedData{
-			{Label: "192.168.1.3", Upload: 50, Download: 50, Total: 100, Count: 1},  // dev-b: 100
+			{Label: "192.168.1.3", Upload: 50, Download: 50, Total: 100, Count: 1},    // dev-b: 100
 			{Label: "192.168.1.10", Upload: 300, Download: 300, Total: 600, Count: 3}, // dev-a: 600
-			{Label: "192.168.1.4", Upload: 10, Download: 10, Total: 20, Count: 1},   // dev-c: 20
+			{Label: "192.168.1.4", Upload: 10, Download: 10, Total: 20, Count: 1},     // dev-c: 20
 		}
 
 		got := svc.applyDeviceLabelAndMACAggregate(data, 1000, 2000)
@@ -559,9 +559,9 @@ func TestFormatDeviceLabel(t *testing.T) {
 			"192.168.1.3":  {IP: "192.168.1.3", MAC: "BB:BB:BB:BB:BB:02", Hostname: ""},
 		}
 		cases := []struct {
-			ip          string
-			wantLabel   string
-			wantMAC     string
+			ip        string
+			wantLabel string
+			wantMAC   string
 		}{
 			{"192.168.1.10", "dev-a", "AA:AA:AA:AA:AA:01"},
 			{"192.168.1.3", "BB:BB:BB:BB:BB:02", "BB:BB:BB:BB:BB:02"},
