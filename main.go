@@ -38,11 +38,6 @@ const (
 	// to hundreds of MB, which slows every read that must merge it.
 	walCheckpointInterval = 5 * time.Minute
 	defaultAllowedOrigin  = "*"
-
-	// Device identity resolution constants
-	deviceMappingRefreshInterval  = 5 * time.Minute
-	deviceMappingDebounceInterval = 30 * time.Second
-	deviceMappingPeriodicInterval = 5 * time.Minute
 )
 
 var isContainerRuntime = func() bool {
@@ -306,24 +301,10 @@ func newApplication(cfg config, dbPath string) (*application, error) {
 		lastVacuum:             time.Time{},
 		aggregateBuffer:        make(map[string]*aggregatedEntry),
 		hostMinuteWindows:      make(map[string]*hostTrafficWindow),
-		deviceMappings:         make(map[string]*deviceMapping),
 	}
 
-	// 初始化 ubus 客户端（仅在 OPENWRT_UBUS_URL 配置时）
-	if cfg.UbusURL != "" {
-		svc.ubusCli = &ubusClient{
-			url:      cfg.UbusURL,
-			username: cfg.UbusUsername,
-			password: cfg.UbusPassword,
-			client:   &http.Client{Timeout: 10 * time.Second},
-		}
-		// 从 device_mappings 表加载历史映射到内存
-		if err := svc.loadDeviceMappingsFromDB(); err != nil {
-			log.Printf("加载历史设备映射失败: %v", err)
-		} else {
-			log.Printf("已从数据库加载 %d 条设备映射", len(svc.deviceMappings))
-		}
-	}
+	// fork-ubus: 初始化 ubus 客户端并预热历史设备映射（未配置时零开销）
+	svc.initUbusFromConfig(cfg)
 
 	app.svc = svc
 	app.listener = listener
@@ -343,10 +324,8 @@ func (a *application) start() {
 		a.svc.runCollector(a.ctx)
 	}()
 
-	// 启动定期设备映射刷新（仅在 ubus 已配置时）
-	if a.svc.ubusEnabled() {
-		go a.svc.runPeriodicDeviceRefresh(a.ctx)
-	}
+	// fork-ubus: 挂入周期设备映射刷新（仅 ubus 已配置时）
+	a.svc.startUbusWorkers(a.ctx)
 
 	go func() {
 		log.Printf("traffic monitor listening on %s", a.cfg.ListenAddr)
@@ -1533,16 +1512,8 @@ func (s *service) processConnections(ctx context.Context, payload *connectionsRe
 	}
 	s.mu.Unlock()
 
-	// 检测新 source_ip，异步触发设备映射刷新
-	sourceIPs := make([]string, 0, len(logs))
-	for _, log := range logs {
-		if log.SourceIP != "" {
-			sourceIPs = append(sourceIPs, log.SourceIP)
-		}
-	}
-	if len(sourceIPs) > 0 {
-		s.checkNewIPs(sourceIPs)
-	}
+	// fork-ubus: 检测新 source_ip，异步触发设备映射刷新
+	s.notifyNewSourceIPs(logs)
 
 	if len(logs) > 0 {
 		if err := s.addToAggregateBuffer(logs, nowMS); err != nil {
@@ -2123,8 +2094,8 @@ func (s *service) cleanupOldLogs(nowMS int64) error {
 		return err
 	}
 
-	// 同时清理 device_mappings 中 last_seen 早于 retention 截止时间的记录
-	if _, err := s.db.Exec(`DELETE FROM device_mappings WHERE last_seen < ?`, aggCutoff); err != nil {
+	// fork-ubus: 清理 last_seen 早于 retention 截止时间的设备映射
+	if err := s.cleanupDeviceMappings(aggCutoff); err != nil {
 		return err
 	}
 
@@ -2552,10 +2523,8 @@ func (s *service) handleAggregate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 对 sourceIP 维度应用设备 label 增强和 MAC 聚合
-	if dimension == "sourceIP" {
-		data = s.applyDeviceLabelAndMACAggregate(data, start, end)
-	}
+	// fork-ubus: sourceIP 维度归并为设备（MAC）视图
+	data = s.applyUbusDeviceView(data, dimension, start, end)
 
 	writeJSON(w, http.StatusOK, data)
 }
@@ -2578,31 +2547,9 @@ func (s *service) handleSubstats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 对 sourceIP 维度，检查是否以 MAC 地址传入，若是则反查所有关联 IP
-	if dimension == "sourceIP" && s.ubusEnabled() && looksLikeMAC(label) {
-		ips := s.resolveMACToIPs(label, start, end)
-		if len(ips) > 0 {
-			var data []aggregatedData
-			if r.URL.Query().Get("summary") == "1" {
-				// 汇总模式：summary 表覆盖 4 倍保留期窗口，raw 表仅补 summary
-				// 覆盖终点之后的部分，保证下钻数字与父级汇总行一致
-				data, err = s.querySummarySecondaryByIPs(ips, start, end)
-			} else {
-				data, err = s.querySubstatsByIPs(dimension, ips, start, end)
-			}
-			if err != nil {
-				writeError(w, http.StatusBadRequest, err)
-				return
-			}
-			writeJSON(w, http.StatusOK, data)
-			return
-		}
-		// 汇总模式下 MAC 解析不到关联 IP（如映射已被 retention 清理）：
-		// 直接返回空数组，避免把 MAC 当 IP 对 summary/raw 表做恒空查询
-		if r.URL.Query().Get("summary") == "1" {
-			writeJSON(w, http.StatusOK, []aggregatedData{})
-			return
-		}
+	// fork-ubus: sourceIP 维度以 MAC 传入时反查关联 IP 下钻（命中即写出响应）
+	if s.trySubstatsByMAC(w, r, dimension, label, start, end) {
+		return
 	}
 
 	var data []aggregatedData
@@ -2678,8 +2625,8 @@ func (s *service) handleDevicesByHost(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	// 应用设备 label 增强和 MAC 聚合
-	data = s.applyDeviceLabelAndMACAggregate(data, start, end)
+	// fork-ubus: 归并为设备（MAC）视图
+	data = s.applyUbusDeviceView(data, "sourceIP", start, end)
 	writeJSON(w, http.StatusOK, data)
 }
 
@@ -2712,8 +2659,8 @@ func (s *service) handleDevicesByProxyHost(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	// 应用设备 label 增强和 MAC 聚合
-	data = s.applyDeviceLabelAndMACAggregate(data, start, end)
+	// fork-ubus: 归并为设备（MAC）视图
+	data = s.applyUbusDeviceView(data, "sourceIP", start, end)
 	writeJSON(w, http.StatusOK, data)
 }
 
@@ -2766,18 +2713,9 @@ func (s *service) handleConnectionDetails(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// 对 sourceIP 维度，检查 primary 是否以 MAC 地址传入
-	if dimension == "sourceIP" && s.ubusEnabled() && looksLikeMAC(primary) {
-		ips := s.resolveMACToIPs(primary, start, end)
-		if len(ips) > 0 {
-			data, err := s.queryConnectionDetailsByIPs(ips, secondary, start, end)
-			if err != nil {
-				writeError(w, http.StatusBadRequest, err)
-				return
-			}
-			writeJSON(w, http.StatusOK, data)
-			return
-		}
+	// fork-ubus: sourceIP 维度以 MAC 传入时反查关联 IP 查询明细（命中即写出响应）
+	if s.tryConnectionDetailsByMAC(w, dimension, primary, secondary, start, end) {
+		return
 	}
 
 	if r.URL.Query().Get("summary") == "1" {
@@ -3076,46 +3014,6 @@ func (s *service) querySummarySecondary(dimension, primary string, start, end in
 	}
 	mergeAggregatedDataRows(merged, detailRows)
 	mergeAggregatedDataRows(merged, s.queryByFiltersFromBuffer(bufferGroupColumn, bufferFilter, args, start, end))
-	return sortedAggregatedDataRows(merged), nil
-}
-
-// querySummarySecondaryByIPs 在汇总模式下按 MAC 反查出的多个源 IP 查询子统计。
-// 合并语义与 querySummaryByDimension / querySummarySecondary 一致：
-// summary 表覆盖 [start, end] 全窗口（4 倍保留期），raw 聚合表仅补 summary
-// 覆盖终点之后（fallbackStart = max(summaryCoveredEnd, start)）的部分，
-// 内存缓冲补 [start, end]，保证 MAC 下钻数字与父级汇总行一致。
-func (s *service) querySummarySecondaryByIPs(ips []string, start, end int64) ([]aggregatedData, error) {
-	placeholders := make([]string, len(ips))
-	args := make([]any, 0, len(ips))
-	for i, ip := range ips {
-		placeholders[i] = "?"
-		args = append(args, ip)
-	}
-	inList := strings.Join(placeholders, ",")
-
-	detailStart, err := s.summaryCoveredEnd()
-	if err != nil {
-		return nil, err
-	}
-	fallbackStart := detailStart
-	if fallbackStart < start {
-		fallbackStart = start
-	}
-
-	rows, err := s.querySummaryRows("source_ip", "secondary_label", " AND label IN ("+inList+")", args, start, end)
-	if err != nil {
-		return nil, err
-	}
-	merged := make(map[string]*aggregatedData)
-	mergeAggregatedDataRows(merged, rows)
-
-	bufferFilter := "source_ip IN (" + inList + ")"
-	detailRows, err := s.queryByFiltersFromAggregates("host", bufferFilter, args, fallbackStart, end)
-	if err != nil {
-		return nil, err
-	}
-	mergeAggregatedDataRows(merged, detailRows)
-	mergeAggregatedDataRows(merged, s.queryByFiltersFromBuffer("host", bufferFilter, args, start, end))
 	return sortedAggregatedDataRows(merged), nil
 }
 

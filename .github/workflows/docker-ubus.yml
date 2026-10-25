@@ -1,0 +1,331 @@
+# fork: 本文件是 fork 专属 CI（与上游 build.yml / release.yml 解耦，降低合并冲突面）。
+# fork: 承接原 fork 版 build.yml / release.yml 的全部 fork 逻辑：
+# fork:   - ghcr.io/<owner>/clash-traffic-monitor 镜像推送，tag 带 -ubus 后缀
+# fork:   - 整包构建（go build .，配合仓库 Dockerfile）
+# fork:   - Manual Build 手动触发 + push_docker=true 输入
+# fork:   - Release 创建时自动构建二进制并推送镜像
+# fork: 镜像名 / 标签命名与迁移前完全一致：
+# fork:   手动触发（push_docker=true）: <arch>-<短SHA>-ubus，manifest <短SHA>-ubus
+# fork:   Release 触发:                  <arch>-<版本>-ubus，manifest <版本>-ubus + latest
+name: Fork Build (ubus)
+
+on:
+  workflow_dispatch:
+    inputs:
+      push_docker:
+        description: "Push Docker image"
+        type: boolean
+        default: false
+  release:
+    types: [created]
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  APP_DIR: .
+
+jobs:
+  test-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Install C compiler
+        run: sudo apt-get update && sudo apt-get install -y gcc
+
+      - name: Test
+        env:
+          CGO_ENABLED: "1"
+        run: |
+          go test ./...
+          go vet ./...
+
+  test-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Use preinstalled mingw toolchain
+        shell: pwsh
+        run: |
+          if (-not (Test-Path 'C:\mingw64\bin\gcc.exe')) { throw 'preinstalled mingw64 toolchain not found' }
+          Add-Content $env:GITHUB_PATH 'C:\mingw64\bin'
+          gcc --version
+
+      - name: Test
+        env:
+          CGO_ENABLED: "1"
+          CC: gcc
+        run: go test ./...
+
+  build-binaries:
+    needs: [test-linux, test-windows]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            cc: gcc
+            ext: ""
+            ldflags: "-s -w"
+          - goos: linux
+            goarch: arm64
+            cc: aarch64-linux-gnu-gcc
+            ext: ""
+            ldflags: "-s -w"
+          - goos: windows
+            goarch: amd64
+            cc: x86_64-w64-mingw32-gcc
+            ext: ".exe"
+            ldflags: "-s -w -H=windowsgui"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Install cross-compilers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu gcc-mingw-w64-x86-64
+
+      - name: Build binary
+        working-directory: ${{ env.APP_DIR }}
+        env:
+          CGO_ENABLED: "1"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CC: ${{ matrix.cc }}
+        run: |
+          OUTPUT_NAME=traffic-monitor-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
+          echo "Building $OUTPUT_NAME"
+          go build -ldflags="${{ matrix.ldflags }}" -o "./$OUTPUT_NAME" .
+          chmod +x "./$OUTPUT_NAME" || true
+
+      - name: Verify Windows GUI subsystem
+        if: matrix.goos == 'windows'
+        run: |
+          x86_64-w64-mingw32-objdump -p ./traffic-monitor-windows-amd64.exe | grep -q "Subsystem.*Windows GUI" || {
+            echo "windows binary is not a GUI subsystem binary"
+            exit 1
+          }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: traffic-monitor-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
+          path: ${{ env.APP_DIR }}/traffic-monitor-*
+
+      - name: Upload to Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: traffic-monitor-*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-musl-arm64:
+    needs: [test-linux, test-windows]
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Build musl arm64 binary via Alpine container
+        run: |
+          docker run --rm \
+            -v "$(pwd):/app" -w /app \
+            --platform linux/arm64 \
+            golang:1.21-alpine \
+            sh -c "apk add --no-cache gcc musl-dev && \
+                   CGO_ENABLED=1 go build -ldflags='-s -w' -o traffic-monitor-linux-arm64-musl ."
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: traffic-monitor-linux-arm64-musl
+          path: traffic-monitor-linux-arm64-musl
+
+      - name: Upload to Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: traffic-monitor-linux-arm64-musl
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-macos:
+    needs: [test-linux, test-windows]
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Build macOS arm64 binary
+        working-directory: ${{ env.APP_DIR }}
+        env:
+          CGO_ENABLED: "1"
+          GOOS: darwin
+          GOARCH: arm64
+        run: |
+          OUTPUT_NAME=traffic-monitor-macos-arm64
+          echo "Building $OUTPUT_NAME"
+          go build -ldflags="-s -w" -o "./$OUTPUT_NAME" .
+          chmod +x "./$OUTPUT_NAME"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: traffic-monitor-macos-arm64
+          path: ${{ env.APP_DIR }}/traffic-monitor-macos-arm64
+
+      - name: Upload macOS binary to Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: traffic-monitor-macos-arm64
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-docker:
+    needs: [test-linux, test-windows]
+    name: Build Docker Image (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'release' || github.event.inputs.push_docker == 'true' }}
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+          - arch: arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate version
+        id: version
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            VERSION=${GITHUB_REF#refs/tags/}
+          else
+            VERSION=$(git rev-parse --short HEAD)
+          fi
+          VERSION=${VERSION#v}
+          echo "version=$VERSION-ubus" >> "$GITHUB_OUTPUT"
+
+      - name: Setup QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        env:
+          BUILDX_NO_DEFAULT_ATTESTATIONS: 1
+
+      - name: Login to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/clash-traffic-monitor
+          flavor: |
+            latest=false
+          tags: |
+            type=raw,value=${{ matrix.arch }}-${{ steps.version.outputs.version }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ env.APP_DIR }}
+          file: ${{ env.APP_DIR }}/Dockerfile
+          platforms: linux/${{ matrix.arch }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: false
+          sbom: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  create-docker-manifest:
+    name: Create Docker Multi-Arch Manifest
+    runs-on: ubuntu-latest
+    needs: build-docker
+    if: ${{ github.event_name == 'release' || github.event.inputs.push_docker == 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate version
+        id: version
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            VERSION=${GITHUB_REF#refs/tags/}
+          else
+            VERSION=$(git rev-parse --short HEAD)
+          fi
+          VERSION=${VERSION#v}
+          echo "version=$VERSION-ubus" >> "$GITHUB_OUTPUT"
+
+      - name: Login to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Create and push manifest
+        run: |
+          # 创建版本 manifest（带 -ubus 后缀）
+          docker buildx imagetools create \
+            -t ghcr.io/${{ github.repository_owner }}/clash-traffic-monitor:${{ steps.version.outputs.version }} \
+            ghcr.io/${{ github.repository_owner }}/clash-traffic-monitor:amd64-${{ steps.version.outputs.version }} \
+            ghcr.io/${{ github.repository_owner }}/clash-traffic-monitor:arm64-${{ steps.version.outputs.version }}
+
+          # Release（tag 触发）时创建 latest manifest
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            docker buildx imagetools create \
+              -t ghcr.io/${{ github.repository_owner }}/clash-traffic-monitor:latest \
+              ghcr.io/${{ github.repository_owner }}/clash-traffic-monitor:amd64-${{ steps.version.outputs.version }} \
+              ghcr.io/${{ github.repository_owner }}/clash-traffic-monitor:arm64-${{ steps.version.outputs.version }}
+          fi
